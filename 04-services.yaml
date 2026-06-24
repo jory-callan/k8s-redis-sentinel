@@ -1,0 +1,112 @@
+# ──────────────────────────────────────────────────────────────
+# All Services for Redis-Sentinel cluster
+# ──────────────────────────────────────────────────────────────
+
+# redis-hl: Headless, stable per-pod DNS (redis-0.redis-hl, redis-1, ...)
+# publishNotReadyAddresses=true so slaves (NotReady) are also resolvable
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-hl
+  namespace: redis
+  labels:
+    app: redis
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+
+# redis-master: NodePort :30001, routes ONLY to master
+# (readinessProbe=ROLE=master → only master pod is Ready → only master gets endpoints)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-master
+  namespace: redis
+  labels:
+    app: redis
+spec:
+  type: NodePort
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      nodePort: 30001
+
+# redis-read: NodePort :30002, routes to ALL pods (master + slaves)
+# publishNotReadyAddresses=true so slaves receive read traffic too
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-read
+  namespace: redis
+  labels:
+    app: redis
+spec:
+  type: NodePort
+  publishNotReadyAddresses: true
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      nodePort: 30002
+
+# sentinel-hl: Headless, stable per-pod DNS (sentinel-0.sentinel-hl, ...)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-hl
+  namespace: redis
+  labels:
+    app: sentinel
+spec:
+  clusterIP: None
+  selector:
+    app: sentinel
+  ports:
+    - name: sentinel
+      port: 26379
+
+# redis-exporter: Prometheus metrics for Redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-exporter
+  namespace: redis
+  labels:
+    app: redis
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: metrics
+      port: 9121
+
+# sentinel-exporter: Prometheus metrics for Sentinel
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-exporter
+  namespace: redis
+  labels:
+    app: sentinel
+spec:
+  selector:
+    app: sentinel
+  ports:
+    - name: metrics
+      port: 9121

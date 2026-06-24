@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel-config
+  namespace: redis
+data:
+  entrypoint.sh: |
+    #!/bin/sh
+    # Sentinel entrypoint — discovers master and starts monitoring
+    # No 'set -e' (dash compatibility, see PITFALLS.md #1)
+
+    NAMESPACE="${NAMESPACE:-redis}"
+    MY_IP="${POD_IP:-$(hostname -i | awk '{print $1}')}"
+
+    echo "[sentinel] ip=${MY_IP}"
+
+    # ── Helper: redis-cli with optional auth ──────────
+    # NOTE: 'timeout' wraps redis-cli (external cmd), NOT a shell function (PITFALLS.md #12)
+    # NOTE: redis-cli 5.0 has no --timeout flag (that's Redis 6+), use 'timeout' cmd
+    cli() {
+      if [ -n "${REDIS_PASSWORD:-}" ]; then
+        timeout 2 redis-cli -a "${REDIS_PASSWORD}" "$@" 2>/dev/null
+      else
+        timeout 2 redis-cli "$@" 2>/dev/null
+      fi
+    }
+
+    # ── Find master: ask other sentinels, then scan redis pods ──
+    find_master() {
+      # 1. Ask other sentinels
+      for s in sentinel-0 sentinel-1 sentinel-2; do
+        H="${s}.sentinel-hl.${NAMESPACE}.svc"
+        IP="$(cli -h "${H}" -p 26379 SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -1)"
+        if [ -n "${IP}" ] && [ "${IP}" != "nil" ]; then
+          echo "${IP}"
+          return 0
+        fi
+      done
+      # 2. Scan redis pods for ROLE=master
+      for r in redis-0 redis-1 redis-2; do
+        H="${r}.redis-hl.${NAMESPACE}.svc"
+        ROLE="$(cli -h "${H}" -p 6379 ROLE 2>/dev/null | head -1)"
+        if [ "${ROLE}" = "master" ]; then
+          IP="$(getent hosts "${H}" 2>/dev/null | awk '{print $1}')"
+          if [ -n "${IP}" ]; then
+            echo "${IP}"
+            return 0
+          fi
+        fi
+      done
+      return 1
+    }
+
+    # ── Wait for master (retry 20x = ~60s) ────────────
+    MASTER_IP=""
+    i=0
+    while [ "$i" -lt 20 ]; do
+      i=$((i + 1))
+      MASTER_IP="$(find_master)" && break
+      sleep 3
+    done
+
+    # Fallback: redis-0 (cold start default)
+    if [ -z "${MASTER_IP}" ]; then
+      echo "[cold] no master found, defaulting to redis-0"
+      MASTER_IP="$(getent hosts "redis-0.redis-hl.${NAMESPACE}.svc" 2>/dev/null | awk '{print $1}')"
+      [ -z "${MASTER_IP}" ] && MASTER_IP="127.0.0.1"
+    fi
+
+    echo "[sentinel] monitoring ${MASTER_IP}:6379"
+
+    # ── Generate sentinel.conf ────────────────────────
+    {
+      echo "port 26379"
+      echo "daemonize no"
+      echo "pidfile /data/sentinel.pid"
+      echo 'logfile ""'
+      echo "dir /tmp"
+      echo "protected-mode no"
+      echo "sentinel monitor mymaster ${MASTER_IP} 6379 2"
+      echo "sentinel down-after-milliseconds mymaster 5000"
+      echo "sentinel failover-timeout mymaster 10000"
+      echo "sentinel parallel-syncs mymaster 1"
+      echo "sentinel announce-ip ${MY_IP}"
+      echo "sentinel announce-port 26379"
+      if [ -n "${REDIS_PASSWORD:-}" ]; then
+        echo "requirepass ${REDIS_PASSWORD}"
+        echo "sentinel auth-pass mymaster ${REDIS_PASSWORD}"
+      fi
+    } > /data/sentinel.conf
+
+    exec redis-sentinel /data/sentinel.conf

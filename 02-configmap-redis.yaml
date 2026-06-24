@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: redis
+data:
+  redis.conf: |
+    port 6379
+    protected-mode no
+    daemonize no
+    pidfile /data/redis.pid
+    logfile ""
+    dir /data
+
+    # RDB persistence
+    save 900 1
+    save 300 10
+    save 60 10000
+
+    # Anti-split-brain: master rejects writes if <1 slave ACKed within 10s
+    min-slaves-to-write 1
+    min-slaves-max-lag 10
+
+    # Announce real pod IP (replaced by startup.sh)
+    slave-announce-ip __ANNOUNCE_IP__
+
+    # Replication
+    slave-serve-stale-data yes
+    slave-read-only yes
+    slave-priority 100
+
+    # Connection
+    timeout 0
+    tcp-keepalive 300
+    tcp-backlog 511
+
+  startup.sh: |
+    #!/bin/sh
+    # Redis startup — decides master/slave role
+    # No 'set -e' (dash + local + $() = silent exit, see PITFALLS.md #1)
+
+    NAMESPACE="${NAMESPACE:-redis}"
+    ORDINAL="$(hostname | awk -F- '{print $NF}')"
+    MY_IP="${POD_IP:-$(hostname -i | awk '{print $1}')}"
+
+    echo "[startup] ordinal=${ORDINAL} ip=${MY_IP}"
+
+    # ── Build redis.conf ──────────────────────────────
+    cp /conf/redis.conf /data/redis.conf
+    sed -i "s/__ANNOUNCE_IP__/${MY_IP}/" /data/redis.conf
+
+    if [ -n "${REDIS_PASSWORD:-}" ]; then
+      echo "requirepass ${REDIS_PASSWORD}" >> /data/redis.conf
+      echo "masterauth ${REDIS_PASSWORD}"   >> /data/redis.conf
+      echo "[auth] password set"
+    else
+      echo "[auth] no password (insecure)"
+    fi
+
+    # ── Helper: redis-cli with optional auth ──────────
+    # NOTE: 'timeout' wraps redis-cli (external cmd), NOT a shell function (PITFALLS.md #12)
+    # NOTE: redis-cli 5.0 has no --timeout flag (that's Redis 6+), use 'timeout' cmd
+    cli() {
+      if [ -n "${REDIS_PASSWORD:-}" ]; then
+        timeout 2 redis-cli -a "${REDIS_PASSWORD}" "$@" 2>/dev/null
+      else
+        timeout 2 redis-cli "$@" 2>/dev/null
+      fi
+    }
+
+    # ── Ask sentinel for master (retry 5x = ~15s) ────
+    get_master_from_sentinel() {
+      i=0
+      while [ "$i" -lt 5 ]; do
+        i=$((i + 1))
+        for s in sentinel-0 sentinel-1 sentinel-2; do
+          H="${s}.sentinel-hl.${NAMESPACE}.svc"
+          IP="$(cli -h "${H}" -p 26379 SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -1)"
+          if [ -n "${IP}" ] && [ "${IP}" != "nil" ]; then
+            echo "${IP}"
+            return 0
+          fi
+        done
+        sleep 3
+      done
+      return 1
+    }
+
+    # ── Role decision ─────────────────────────────────
+    MASTER_IP="$(get_master_from_sentinel)"
+
+    if [ -n "${MASTER_IP}" ]; then
+      # Sentinel knows the master — verify it's reachable before SLAVEOF.
+      # During failover, sentinel may return a stale (down) master IP.
+      i=0
+      while [ "$i" -lt 5 ]; do
+        i=$((i + 1))
+        if [ "${MASTER_IP}" = "${MY_IP}" ]; then
+          break
+        fi
+        if cli -h "${MASTER_IP}" -p 6379 PING 2>/dev/null | grep -q PONG; then
+          break
+        fi
+        echo "[warn] master ${MASTER_IP} unreachable, retrying sentinel..."
+        sleep 3
+        NEW_IP="$(get_master_from_sentinel)"
+        [ -n "${NEW_IP}" ] && MASTER_IP="${NEW_IP}"
+      done
+
+      if [ "${MASTER_IP}" = "${MY_IP}" ]; then
+        echo "[role] master (sentinel confirmed)"
+        exec redis-server /data/redis.conf
+      else
+        echo "[role] slave of ${MASTER_IP} (sentinel)"
+        exec redis-server /data/redis.conf --slaveof "${MASTER_IP}" 6379
+      fi
+    fi
+
+    # ── Cold start: no sentinel available ────────────
+    if [ "${ORDINAL}" = "0" ]; then
+      echo "[role] master (cold start, ordinal=0)"
+      exec redis-server /data/redis.conf
+    fi
+
+    # ordinal > 0: wait for redis-0 (NEVER self-promote — prevents split-brain)
+    echo "[cold] waiting for redis-0 to become master..."
+    i=0
+    while [ "$i" -lt 30 ]; do
+      i=$((i + 1))
+      if cli -h "redis-0.redis-hl.${NAMESPACE}.svc" -p 6379 PING 2>/dev/null | grep -q PONG; then
+        echo "[role] slave of redis-0 (cold start)"
+        exec redis-server /data/redis.conf --slaveof "redis-0.redis-hl.${NAMESPACE}.svc" 6379
+      fi
+      sleep 2
+    done
+
+    # Cannot reach redis-0 — crash (K8s restarts). Do NOT become standalone master.
+    echo "[error] cannot reach redis-0 after 60s, exiting"
+    exit 1
