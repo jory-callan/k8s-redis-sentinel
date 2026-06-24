@@ -112,6 +112,36 @@ Sentinel 使用 emptyDir (无持久化需求)。
 - 新增 08-rbac.yaml (ServiceAccount + Role + RoleBinding)
 **Failover 测试**: 杀 redis-2 (master) → redis-1 选举 → label 自动更新 → Service 自动切换. 所有 pod 3/3 Ready, 零失败事件.
 
+### V3.1 优化 (2026-06-25): sidecar 加固 + check.sh 修正
+
+**sidecar 优化**:
+- 启动时等待 exporter ready (避免启动噪音)
+- 只在 role 变化时 PATCH label (减少 API 调用)
+- 输出日志 (role 变化 + http code)
+- 加 livenessProbe (检查 /tmp/last_alive 心跳文件, 60s 无更新则重启)
+- 检查 PATCH 返回的 HTTP code (200 才更新 LAST_ROLE)
+
+**check.sh 修正**:
+- 区分 online (master connected_slaves) 和 tracked (sentinel num-slaves)
+- tracked > online 时提示"历史 IP, 30min 后自动清理, 不影响 failover"
+
+**Sentinel 历史 IP 说明**:
+- Pod 重建 IP 变化 → Sentinel 累积历史 slave 条目 (保留 ~30min)
+- 不影响 failover (只看 state=ok 的 slave) / 不影响复制 / 不影响数据
+- 唯一影响: SENTINEL slaves 返回列表有噪音
+
+**验证**: failover 时 sidecar 日志显示 role=slave → role=master, 零重启, livenessProbe 无误杀. check.sh 显示 online=2 tracked=11 + 提示.
+
+### V3.2 修复 (2026-06-25): 全集群重启死锁
+
+**问题**: 同时删 3 redis + 2 sentinel 后, 所有 redis 成为 slave 去连死 IP, 集群死锁.
+**根因**: sentinel 持久化了旧 master IP, redis 问 sentinel 拿到死 IP 后验证失败但**没有 fallback 到冷启动**, 继续 SLAVEOF 死 IP.
+**修复**:
+1. startup.sh: sentinel master 验证失败后 fallback 到冷启动 (ordinal=0 自举, ordinal>0 等 redis-0)
+2. entrypoint.sh (sentinel): find_master 从其他 sentinel 拿到 IP 后验证可达性, 不可达则扫描 redis pod
+**验证**: 同时删 3 redis + 2 sentinel → redis-0 自举 master → redis-1/2 成为 slave → sentinel 监控新 master → 集群恢复. 所有 pod 3/3 Ready.
+**关键**: 这是"无论如何删除都能恢复"的关键修复.
+
 ---
 
 ## V1 (旧版，已删除) — 问题记录

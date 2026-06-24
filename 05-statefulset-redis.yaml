@@ -141,16 +141,46 @@ spec:
               CACERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
               NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
               APISERVER="https://kubernetes.default.svc"
+              METRICS_URL="http://127.0.0.1:9121/metrics"
+              ALIVE_FILE="/tmp/last_alive"
+
+              echo "[role-tagger] starting, pod=$POD_NAME ns=$NS"
+
+              # Wait for exporter to be ready (avoid noise during startup)
+              i=0
+              while [ "$i" -lt 30 ]; do
+                if curl -s --max-time 2 "$METRICS_URL" >/dev/null 2>&1; then
+                  echo "[role-tagger] exporter ready"
+                  break
+                fi
+                i=$((i+1)); sleep 2
+              done
+
+              LAST_ROLE=""
               while true; do
-                ROLE="$(curl -s --max-time 3 http://127.0.0.1:9121/metrics 2>/dev/null \
+                ROLE="$(curl -s --max-time 3 "$METRICS_URL" 2>/dev/null \
                         | grep '^redis_instance_info' \
                         | sed -n 's/.*role="\([a-z]*\)".*/\1/p' | head -1)"
+
                 if [ "$ROLE" = "master" ] || [ "$ROLE" = "slave" ]; then
-                  curl -s --cacert "$CACERT" -X PATCH \
-                    -H "Authorization: Bearer $TOKEN" \
-                    -H "Content-Type: application/merge-patch+json" \
-                    --data "{\"metadata\":{\"labels\":{\"redis-role\":\"$ROLE\"}}}" \
-                    "$APISERVER/api/v1/namespaces/$NS/pods/$POD_NAME" >/dev/null 2>&1
+                  # Patch label only when role changed (reduce API calls)
+                  if [ "$ROLE" != "$LAST_ROLE" ]; then
+                    HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CACERT" -X PATCH \
+                      -H "Authorization: Bearer $TOKEN" \
+                      -H "Content-Type: application/merge-patch+json" \
+                      --data "{\"metadata\":{\"labels\":{\"redis-role\":\"$ROLE\"}}}" \
+                      "$APISERVER/api/v1/namespaces/$NS/pods/$POD_NAME")"
+                    if [ "$HTTP_CODE" = "200" ]; then
+                      echo "[role-tagger] role=$ROLE (label updated, http=$HTTP_CODE)"
+                      LAST_ROLE="$ROLE"
+                    else
+                      echo "[role-tagger] role=$ROLE but patch failed http=$HTTP_CODE"
+                    fi
+                  fi
+                  # heartbeat: touch alive file every cycle
+                  : > "$ALIVE_FILE"
+                else
+                  echo "[role-tagger] role unknown (empty?), skip"
                 fi
                 sleep 5
               done
@@ -159,6 +189,18 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+          # livenessProbe: if sidecar hasn't updated alive file in 60s, restart it
+          # (covers: curl hang, infinite loop without sleep, exporter down long)
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  [ -f /tmp/last_alive ] && find /tmp/last_alive -mmin -1 | grep -q . || exit 1
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 2
           resources:
             requests:
               cpu: 10m

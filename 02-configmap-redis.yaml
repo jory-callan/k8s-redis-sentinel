@@ -92,13 +92,16 @@ data:
     if [ -n "${MASTER_IP}" ]; then
       # Sentinel knows the master — verify it's reachable before SLAVEOF.
       # During failover, sentinel may return a stale (down) master IP.
+      MASTER_REACHABLE=0
       i=0
       while [ "$i" -lt 5 ]; do
         i=$((i + 1))
         if [ "${MASTER_IP}" = "${MY_IP}" ]; then
+          MASTER_REACHABLE=1
           break
         fi
         if cli -h "${MASTER_IP}" -p 6379 PING 2>/dev/null | grep -q PONG; then
+          MASTER_REACHABLE=1
           break
         fi
         echo "[warn] master ${MASTER_IP} unreachable, retrying sentinel..."
@@ -107,16 +110,24 @@ data:
         [ -n "${NEW_IP}" ] && MASTER_IP="${NEW_IP}"
       done
 
-      if [ "${MASTER_IP}" = "${MY_IP}" ]; then
-        echo "[role] master (sentinel confirmed)"
-        exec redis-server /data/redis.conf
+      if [ "${MASTER_REACHABLE}" = "1" ]; then
+        if [ "${MASTER_IP}" = "${MY_IP}" ]; then
+          echo "[role] master (sentinel confirmed)"
+          exec redis-server /data/redis.conf
+        else
+          echo "[role] slave of ${MASTER_IP} (sentinel)"
+          exec redis-server /data/redis.conf --slaveof "${MASTER_IP}" 6379
+        fi
       else
-        echo "[role] slave of ${MASTER_IP} (sentinel)"
-        exec redis-server /data/redis.conf --slaveof "${MASTER_IP}" 6379
+        # Sentinel returned a master but it's unreachable after 5 retries.
+        # This happens on full-cluster restart: sentinel has stale master IP
+        # from persisted sentinel.conf, but that pod is gone.
+        # Fallback to cold-start logic below (don't SLAVEOF a dead IP).
+        echo "[warn] sentinel master ${MASTER_IP} unreachable after retries, fallback to cold start"
       fi
     fi
 
-    # ── Cold start: no sentinel available ────────────
+    # ── Cold start: no sentinel OR sentinel master unreachable ────
     if [ "${ORDINAL}" = "0" ]; then
       echo "[role] master (cold start, ordinal=0)"
       exec redis-server /data/redis.conf

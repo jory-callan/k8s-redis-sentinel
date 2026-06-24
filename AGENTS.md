@@ -35,15 +35,18 @@ Redis 5.0.8 · K8s 1.19+ · 官方镜像
 **方案**: 移除所有 `set -e`，改为显式 `||` 错误处理。
 **详见**: [PITFALLS.md](PITFALLS.md) 坑 1。
 
-### 决策 4: startup.sh 三分支决策
+### 决策 4: startup.sh 三分支决策 + 死 IP fallback
 
 ```
-1. 问 sentinel → 有 master → 按信息启动
-2. 无 sentinel → ordinal=0 → 自举 master
-3. 无 sentinel → ordinal>0 → 等 redis-0 (永不自举，防脑裂)
+1. 问 sentinel → 有 master → 验证可达 → 可达则跟随
+2. 问 sentinel → 有 master → 验证失败 → fallback 到冷启动 (坑 21)
+3. 无 sentinel → ordinal=0 → 自举 master
+4. 无 sentinel → ordinal>0 → 等 redis-0 (永不自举，防脑裂)
 ```
 
-**关键改进**: ordinal>0 **无 standalone fallback** — 宁可 crash loop 也不脑裂。
+**关键改进**:
+- ordinal>0 **无 standalone fallback** — 宁可 crash loop 也不脑裂
+- sentinel 返回死 IP 时 fallback 到冷启动 (V3.2 修复, 全集群重启自愈)
 
 ### 决策 5: Redis 5.0.x DNS 限制
 

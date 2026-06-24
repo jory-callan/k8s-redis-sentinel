@@ -32,8 +32,12 @@ data:
         H="${s}.sentinel-hl.${NAMESPACE}.svc"
         IP="$(cli -h "${H}" -p 26379 SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -1)"
         if [ -n "${IP}" ] && [ "${IP}" != "nil" ]; then
-          echo "${IP}"
-          return 0
+          # Verify the master IP is actually reachable (not a stale entry
+          # from persisted sentinel.conf on full-cluster restart).
+          if cli -h "${IP}" -p 6379 PING 2>/dev/null | grep -q PONG; then
+            echo "${IP}"
+            return 0
+          fi
         fi
       done
       # 2. Scan redis pods for ROLE=master

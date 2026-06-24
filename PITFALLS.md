@@ -228,3 +228,47 @@ done
 - slave 也 Ready → headless DNS 正常解析
 - failover 后 label 自动更新（~5s），Service 自动切换
 **验证**: failover 测试（杀 redis-2 master）→ redis-1 成为新 master → label 自动更新 → redis-master.svc endpoint 自动切换到 redis-1。所有 pod 3/3 Ready，零失败事件。
+
+---
+
+## 坑 19: Sentinel num-slaves 包含历史 IP
+
+**现象**: `SENTINEL master mymaster` 报 `num-slaves=11`，但 master 实际只有 2 个 online slave。
+**根因**: Pod 重建时 IP 变化（如 failover 测试 redis-2 从 `10.42.1.208` → `10.42.1.228` → `10.42.1.58`），Sentinel 把新 slave 加入列表，但**旧 slave 条目不立即删除**，保留约 30 分钟（直到确认 SDOWN 才清理）。
+**影响**:
+- **不影响 failover**: Sentinel 选举只看 `state=ok` 的 slave，历史 IP 都是 `S_DOWN/disconnected`
+- **不影响复制**: master 只向 online slave 同步
+- **不影响数据**: 完全无关
+- **唯一影响**: `SENTINEL slaves` 返回列表有噪音，运维可能误判
+**修复**: check.sh 区分 `online`（master connected_slaves）和 `tracked`（sentinel num-slaves），tracked > online 时提示"历史 IP，30min 后自动清理"。
+**验证**: `online=2 tracked=11`，exporter `ok_slaves=2`（与 master connected_slaves 一致）。
+
+---
+
+## 坑 20: role-tagger sidecar 优化
+
+**问题**: 原 sidecar 无日志、无 livenessProbe、每次循环都 PATCH label（即使 role 没变）。
+**优化**:
+1. 启动时等待 exporter ready（避免启动噪音）
+2. 只在 role 变化时 PATCH label（减少 API 调用）
+3. 输出日志（`[role-tagger] role=master (label updated, http=200)`）
+4. 加 livenessProbe：检查 `/tmp/last_alive` 文件是否在 60s 内更新（sidecar 每次循环 touch 一次）
+5. 检查 PATCH 返回的 HTTP code（200 才更新 LAST_ROLE）
+**验证**: failover 时日志显示 `role=slave → role=master`，零重启，livenessProbe 无误杀。
+
+---
+
+## 坑 21: 全集群重启死锁 — sentinel 返回死 IP
+
+**现象**: 同时删 3 个 redis + 2 个 sentinel 后，所有 redis pod 启动后都成为 slave 去连一个**不存在的旧 master IP**（`10.42.1.58`），没有任何 pod 自举为 master，集群死锁。
+**根因**:
+1. sentinel 启动时从**持久化的 sentinel.conf**（emptyDir 不会丢，因为是同一次 pod 生命周期）读到旧 master IP `10.42.1.58`
+2. redis 启动时问 sentinel "谁是 master" → sentinel 返回死 IP `10.42.1.58`
+3. startup.sh 的三分支逻辑：sentinel 返回了 master → 验证可达性失败 5 次 → **但没有 fallback 到冷启动**，而是继续 `SLAVEOF` 死 IP
+4. 所有 redis 都成为 slave 去连死 IP → 没有自举 master → 集群死锁
+**影响**: 全集群重启（如节点维护、断电）后集群无法自愈。
+**修复**:
+1. **startup.sh**: sentinel 返回的 master 验证可达性失败后，**fallback 到冷启动逻辑**（ordinal=0 自举，ordinal>0 等 redis-0）
+2. **entrypoint.sh (sentinel)**: find_master 从其他 sentinel 拿到 master IP 后，**验证可达性**，不可达则继续扫描 redis pod
+**验证**: 同时删 3 redis + 2 sentinel → redis-0 自举 master → redis-1/2 成为 slave → sentinel 监控新 master → 集群恢复。所有 pod 3/3 Ready。
+**关键**: 这是"无论如何删除都能恢复"的关键修复。

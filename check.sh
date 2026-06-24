@@ -138,19 +138,33 @@ fi
 # ── 4. Sentinel 核心信息 ──────────────────────────────────────
 hdr "Sentinel 核心信息"
 
+# Get actual online slave count from master (truth source)
+ONLINE_SLAVES=""
+if [ -n "$MASTER_POD" ]; then
+  ONLINE_SLAVES="$(rcli "$MASTER_POD" INFO replication 2>/dev/null | grep '^connected_slaves:' | cut -d: -f2 | tr -d '\r')"
+  [ -z "$ONLINE_SLAVES" ] && ONLINE_SLAVES="0"
+fi
+
 SENT_MASTER=""
 for pod in sentinel-0 sentinel-1 sentinel-2; do
   if ! kubectl -n "$NS" get pod "$pod" >/dev/null 2>&1; then continue; fi
   master_addr="$(scli "$pod" SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -2 | tr '\n' ':' | sed 's/:$//')"
-  ok_slaves="$(scli "$pod" SENTINEL master mymaster 2>/dev/null | grep -A1 'num-slaves' | tail -1 | tr -d '\r')"
+  # num-slaves includes historical IPs (S_DOWN slaves not yet cleaned up).
+  # Use master's connected_slaves as the actual online count.
+  tracked_slaves="$(scli "$pod" SENTINEL master mymaster 2>/dev/null | grep -A1 'num-slaves' | tail -1 | tr -d '\r')"
   ok_sentinels="$(scli "$pod" SENTINEL master mymaster 2>/dev/null | grep -A1 'num-other-sentinels' | tail -1 | tr -d '\r')"
   sdown="$(scli "$pod" SENTINEL master mymaster 2>/dev/null | grep -A1 'sdown-time' | tail -1 | tr -d '\r')"
   ftimeout="$(scli "$pod" SENTINEL master mymaster 2>/dev/null | grep -A1 'failover-timeout' | tail -1 | tr -d '\r')"
   quorum="$(scli "$pod" SENTINEL master mymaster 2>/dev/null | grep -A1 'quorum' | tail -1 | tr -d '\r')"
 
   [ -z "$SENT_MASTER" ] && SENT_MASTER="$master_addr"
-  ok "$pod: master=$master_addr  slaves=$ok_slaves  sentinels=$ok_sentinels  quorum=$quorum"
+  ok "$pod: master=$master_addr  online=$ONLINE_SLAVES  tracked=$tracked_slaves  sentinels=$ok_sentinels  quorum=$quorum"
 done
+
+# Warn if tracked >> online (historical IPs not yet cleaned)
+if [ -n "$ONLINE_SLAVES" ] && [ -n "$tracked_slaves" ] && [ "$tracked_slaves" -gt "$ONLINE_SLAVES" ] 2>/dev/null; then
+  info "Sentinel tracked=$tracked_slaves > online=$ONLINE_SLAVES (历史 IP, 30min 后自动清理, 不影响 failover)"
+fi
 
 # ── 5. Service 路由验证 ───────────────────────────────────────
 hdr "Service 路由"
