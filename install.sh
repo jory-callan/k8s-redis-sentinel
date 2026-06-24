@@ -13,11 +13,13 @@ kubectl apply -f "$DIR/04-services.yaml"
 kubectl apply -f "$DIR/05-statefulset-redis.yaml"
 kubectl apply -f "$DIR/06-statefulset-sentinel.yaml"
 kubectl apply -f "$DIR/07-pdb.yaml"
+kubectl apply -f "$DIR/08-rbac.yaml"
 
 echo ""
 echo "=== Waiting for pods ready ==="
-# Only redis-0 (master) becomes Ready — slaves are NotReady by design (readinessProbe=ROLE=master)
-kubectl -n redis wait pod/redis-0 --for=condition=Ready --timeout=300s || echo "  WARN: redis-0 not ready"
+# All redis pods become Ready (readinessProbe=PING, not ROLE).
+# Master routing is handled by redis-role label (set by role-tagger sidecar).
+kubectl -n redis wait pod --for=condition=Ready -l app=redis --timeout=300s
 kubectl -n redis wait pod --for=condition=Ready -l app=sentinel --timeout=200s
 
 echo ""

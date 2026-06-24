@@ -15,15 +15,19 @@ Redis 5.0.8 · K8s 1.19+ · 官方镜像
 **代价**: 冷启动时 redis-0 迟迟不启动 → redis-1/2 crash loop 重试 (可接受)。
 **优势**: 不阻塞调度，redis-0 一旦就绪，redis-1/2 立即连接。
 
-### 决策 2: readinessProbe = ROLE=master
+### 决策 2: sidecar + label 替代 readinessProbe 路由 (V3 优化)
 
-**目标**: redis-master.svc 自动只路由到 master，应用零改动。
-**方案**: readinessProbe 检查 `ROLE | head -1 | grep master`。
-  - master → Ready → Service 有 endpoint
-  - slave → NotReady → Service 无 endpoint
-**failover**: 新 master 通过 readiness → Service 自动切流量。
-**副作用**: slave NotReady → headless DNS 默认不解析。
-**修复**: redis-hl 设 `publishNotReadyAddresses: true`。
+**目标**: redis-master.svc 自动只路由到 master，应用零改动，且不产生事件风暴。
+**旧方案 (V2)**: readinessProbe 检查 `ROLE | grep master` → slave NotReady → Service 无 endpoint。
+**问题**: slave 持续产生 `Readiness probe failed` 事件 (10分钟 309 次, 1年数千万次), 给 etcd/kubelet/API server 压力。
+**新方案 (V3)**: role-tagger sidecar + pod label:
+1. `role-tagger` sidecar (`curlimages/curl`) 每 5s 从 redis_exporter metrics 获取 ROLE, PATCH pod label `redis-role=master|slave`
+2. readinessProbe 改为 PING (所有 pod Ready, 零失败事件)
+3. redis-master.svc selector 改为 `redis-role=master` → 只路由到 master
+4. RBAC: ServiceAccount + Role (patch pod label) + RoleBinding
+**failover**: 新 master → sidecar 更新 label → Service 自动切流量 (~5s)。
+**优势**: 消除事件风暴, slave 也 Ready (headless DNS 正常), 无需 `publishNotReadyAddresses`。
+**详见**: [PITFALLS.md](PITFALLS.md) 坑 18。
 
 ### 决策 3: 不设 set -e
 
@@ -56,11 +60,13 @@ Redis 5.0.8 · K8s 1.19+ · 官方镜像
 | `02-configmap-redis.yaml` | redis.conf + startup.sh |
 | `03-configmap-sentinel.yaml` | entrypoint.sh |
 | `04-services.yaml` | 6 个 Service (redis-hl/master/read, sentinel-hl, 2x exporter) |
-| `05-statefulset-redis.yaml` | Redis 3副本 (Parallel + PVC 1Gi) |
+| `05-statefulset-redis.yaml` | Redis 3副本 (Parallel + PVC 1Gi + role-tagger sidecar) |
 | `06-statefulset-sentinel.yaml` | Sentinel 3副本 (Parallel + emptyDir) |
 | `07-pdb.yaml` | 2 个 PDB (minAvailable:2) |
+| `08-rbac.yaml` | role-tagger sidecar 的 RBAC (ServiceAccount + Role + RoleBinding) |
 | `install.sh` | 生产部署 |
 | `test.sh` | 测试套件 (deploy/verify/failover/cleanup) |
+| `check.sh` | 集群状态检测 (pod/role/slaves/sentinel/service/exporter/pdb) |
 | `cleanup.sh` | 交互式清理 |
 | `ATTEMPTS.md` | 尝试路径文档 |
 | `PITFALLS.md` | 坑文档 |
@@ -70,7 +76,7 @@ Redis 5.0.8 · K8s 1.19+ · 官方镜像
 | Component | Probe | InitialDelay | Period | FailureThreshold | MaxWait |
 |-----------|-------|--------------|--------|-----------------|---------|
 | redis | startup | 5s | 5s | 30 | 150s |
-| redis | readiness | 5s | 3s | 3 | 14s |
+| redis | readiness (PING) | 5s | 5s | 3 | 20s |
 | redis | liveness | 10s | 10s | 3 | 40s |
 | sentinel | startup | 5s | 5s | 40 | 200s |
 | sentinel | readiness | 5s | 5s | 3 | 20s |

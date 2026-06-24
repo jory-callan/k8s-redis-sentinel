@@ -22,7 +22,8 @@ spec:
       port: 6379
 
 # redis-master: NodePort :30001, routes ONLY to master
-# (readinessProbe=ROLE=master → only master pod is Ready → only master gets endpoints)
+# (sidecar role-tagger sets redis-role=master on master pod → Service routes to it)
+# This replaces readinessProbe=ROLE=master to avoid storm of probe-failure events.
 ---
 apiVersion: v1
 kind: Service
@@ -35,6 +36,7 @@ spec:
   type: NodePort
   selector:
     app: redis
+    redis-role: master
   ports:
     - name: redis
       port: 6379

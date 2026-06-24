@@ -72,16 +72,14 @@ for pod in redis-0 redis-1 redis-2; do
   node="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.nodeName}')"
   role="$(rcli "$pod" role 2>/dev/null | head -1 || echo 'unreachable')"
 
-  # readinessProbe=ROLE=master → slave 的 redis 容器 NotReady 是预期行为
+  # All pods should be Ready (readinessProbe=PING, not ROLE).
+  # Master routing is handled by redis-role label (set by role-tagger sidecar).
   if [ "$role" = "master" ]; then
-    status_color="$G"
-    [ "$ready" = "true" ] && ok "$pod: master  IP=$ip  node=$node  restarts=$restarts  ready=$ready" || { bad "$pod: master 但 NotReady"; ERRORS=$((ERRORS+1)); }
+    [ "$ready" = "true" ] && ok "$pod: master  IP=$ip  node=$node  restarts=$restarts" || { bad "$pod: master 但 NotReady"; ERRORS=$((ERRORS+1)); }
     MASTER_POD="$pod"
     MASTER_IP="$ip"
   elif [ "$role" = "slave" ]; then
-    status_color="$Y"
-    # slave 的 redis 容器 NotReady 是预期的 (readinessProbe=ROLE=master)
-    echo -e "  ${Y}○${N} $pod: slave   IP=$ip  node=$node  restarts=$restarts  ready=$ready (NotReady 预期)"
+    [ "$ready" = "true" ] && ok "$pod: slave   IP=$ip  node=$node  restarts=$restarts" || { bad "$pod: slave 但 NotReady"; ERRORS=$((ERRORS+1)); }
   else
     bad "$pod: $role  IP=$ip  node=$node  restarts=$restarts  ready=$ready"
     ERRORS=$((ERRORS+1))

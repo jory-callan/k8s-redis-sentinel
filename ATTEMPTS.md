@@ -101,6 +101,16 @@ Sentinel 使用 emptyDir (无持久化需求)。
 - 坑 14: kubectl wait 对 slave 永远超时 → 只等 redis-0
 - 坑 16: Sentinel exporter redis_up=0 → Sentinel 加 `requirepass` (不是 IS_SENTINEL 标志)
 - 坑 17: sentinel failover 中返回过时 master IP → SLAVEOF 前验证 IP 可达 + 重试
+- 坑 18: readinessProbe=ROLE=master 导致事件风暴 → sidecar + label 方案替代
+
+### V3 优化 (2026-06-25): sidecar + label 替代 readinessProbe 路由
+
+**问题**: readinessProbe=ROLE=master 导致 slave 持续产生失败事件 (10分钟 309 次, 1年数千万次)
+**方案**: role-tagger sidecar (curlimages/curl) 每 5s 从 exporter metrics 获取 ROLE, PATCH pod label
+- readinessProbe 改为 PING (所有 pod Ready)
+- redis-master.svc selector 改为 redis-role=master
+- 新增 08-rbac.yaml (ServiceAccount + Role + RoleBinding)
+**Failover 测试**: 杀 redis-2 (master) → redis-1 选举 → label 自动更新 → Service 自动切换. 所有 pod 3/3 Ready, 零失败事件.
 
 ---
 

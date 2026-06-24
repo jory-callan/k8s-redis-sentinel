@@ -16,7 +16,10 @@ spec:
     metadata:
       labels:
         app: redis
+        # Initial label; role-tagger sidecar updates it every 5s based on ROLE.
+        redis-role: slave
     spec:
+      serviceAccountName: redis-role-tagger
       terminationGracePeriodSeconds: 30
       affinity:
         podAntiAffinity:
@@ -64,7 +67,10 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 5
             failureThreshold: 30
-          # readinessProbe: only master passes → redis-master.svc routes to master only
+          # readinessProbe: PING (health check only).
+          # Master routing is handled by redis-role label (set by role-tagger sidecar)
+          # and redis-master.svc selector redis-role=master.
+          # This avoids storm of probe-failure events on slaves.
           readinessProbe:
             exec:
               command:
@@ -72,9 +78,9 @@ spec:
                 - -c
                 - |
                   P="${REDIS_PASSWORD:-}"
-                  if [ -n "$P" ]; then redis-cli -a "$P" ROLE 2>/dev/null; else redis-cli ROLE 2>/dev/null; fi | head -1 | grep -q master
+                  if [ -n "$P" ]; then redis-cli -a "$P" PING 2>/dev/null; else redis-cli PING 2>/dev/null; fi | grep -q PONG
             initialDelaySeconds: 5
-            periodSeconds: 3
+            periodSeconds: 5
             failureThreshold: 3
           livenessProbe:
             exec:
@@ -116,6 +122,46 @@ spec:
           resources:
             requests:
               cpu: 25m
+              memory: 16Mi
+
+        # ── role-tagger sidecar ───────────────────────────
+        # Polls redis_exporter metrics every 5s for role, patches pod label
+        # redis-role=master|slave. redis-master.svc selector uses redis-role=master
+        # → routes only to master. Replaces readinessProbe=ROLE=master (which
+        # caused storm of failure events on slaves).
+        # Uses curlimages/curl (lightweight, ~4MB) — no kubectl/redis-cli needed.
+        - name: role-tagger
+          image: curlimages/curl:7.88.1
+          command:
+            - sh
+            - -c
+            - |
+              set -u
+              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+              CACERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+              NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+              APISERVER="https://kubernetes.default.svc"
+              while true; do
+                ROLE="$(curl -s --max-time 3 http://127.0.0.1:9121/metrics 2>/dev/null \
+                        | grep '^redis_instance_info' \
+                        | sed -n 's/.*role="\([a-z]*\)".*/\1/p' | head -1)"
+                if [ "$ROLE" = "master" ] || [ "$ROLE" = "slave" ]; then
+                  curl -s --cacert "$CACERT" -X PATCH \
+                    -H "Authorization: Bearer $TOKEN" \
+                    -H "Content-Type: application/merge-patch+json" \
+                    --data "{\"metadata\":{\"labels\":{\"redis-role\":\"$ROLE\"}}}" \
+                    "$APISERVER/api/v1/namespaces/$NS/pods/$POD_NAME" >/dev/null 2>&1
+                fi
+                sleep 5
+              done
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: 10m
               memory: 16Mi
 
       volumes:

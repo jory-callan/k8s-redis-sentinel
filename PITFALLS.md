@@ -206,3 +206,25 @@ while [ "$i" -lt 5 ]; do
 done
 ```
 **验证**: redis-0 重启后 `master_host:10.42.2.12`，`master_link_status:up`，数据复制正常。
+
+---
+
+## 坑 18: readinessProbe=ROLE=master 导致事件风暴
+
+**现象**: slave pod 持续产生 `Readiness probe failed` 事件，10 分钟 309 次，1 年累计数千万次。
+**根因**: readinessProbe 检查 `ROLE | grep master`，slave 永远不通过 → 每 3s 产生一个失败事件。
+**影响**:
+- etcd 压力：K8s 事件默认 TTL=1h，同时存在 ~3600 个事件持续写入/删除
+- kubelet 压力：每 3s 执行一次 `redis-cli ROLE` 命令
+- API server 压力：频繁创建/更新 Event 对象
+- 监控告警噪音：持续报 "Unhealthy"
+**解决**: 用 **sidecar + label** 方案替代 readinessProbe 路由：
+1. 加 `role-tagger` sidecar（`curlimages/curl`），每 5s 从 redis_exporter metrics 获取 ROLE，PATCH pod label `redis-role=master|slave`
+2. readinessProbe 改为检查 PING（健康），所有 pod 都 Ready
+3. redis-master.svc selector 改为 `redis-role=master`，只路由到 master
+4. 加 RBAC（ServiceAccount + Role + RoleBinding）
+**优势**:
+- 消除所有 readiness probe 失败事件
+- slave 也 Ready → headless DNS 正常解析
+- failover 后 label 自动更新（~5s），Service 自动切换
+**验证**: failover 测试（杀 redis-2 master）→ redis-1 成为新 master → label 自动更新 → redis-master.svc endpoint 自动切换到 redis-1。所有 pod 3/3 Ready，零失败事件。

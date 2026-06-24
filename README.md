@@ -8,7 +8,7 @@ Redis 5.0.8 · K8s 原生 · 零 Operator · 应用零改动 · Prometheus Expor
 
 ```
                     ┌──────────────────────┐
-                    │  redis-master.svc    │  ← 只路由到 master (readinessProbe)
+                    │  redis-master.svc    │  ← 只路由到 master (redis-role label)
                     │  (port 6379)         │
                     └──────────┬───────────┘
                                │
@@ -64,9 +64,10 @@ vim 01-secret.yaml
 | 02 | `02-configmap-redis.yaml` | redis.conf + startup.sh |
 | 03 | `03-configmap-sentinel.yaml` | sentinel entrypoint.sh |
 | 04 | `04-services.yaml` | 6 个 Service |
-| 05 | `05-statefulset-redis.yaml` | Redis 3副本 (Parallel + PVC) |
+| 05 | `05-statefulset-redis.yaml` | Redis 3副本 (Parallel + PVC + role-tagger sidecar) |
 | 06 | `06-statefulset-sentinel.yaml` | Sentinel 3副本 (Parallel) |
 | 07 | `07-pdb.yaml` | PDB minAvailable:2 |
+| 08 | `08-rbac.yaml` | role-tagger sidecar 的 RBAC |
 
 ## 应用连接
 
@@ -100,7 +101,7 @@ redis-cli -h redis-master.redis.svc -a "$(kubectl get secret redis-secret -n red
 
 ### 2. 应用零改动
 
-`readinessProbe = ROLE=master` → 只有 master 通过 readiness → `redis-master.svc` 自动路由到 master。failover 时新 master 通过 readiness，Service 自动切流量。
+`role-tagger` sidecar 每 5s 从 redis_exporter metrics 获取 ROLE，PATCH pod label `redis-role=master|slave`。`redis-master.svc` selector 为 `redis-role=master` → 只路由到 master。failover 时 sidecar 更新 label，Service 自动切流量（~5s）。readinessProbe 改为 PING，所有 pod Ready，无事件风暴。
 
 ### 3. 冷启动鲁棒性
 
@@ -117,7 +118,7 @@ redis-cli -h redis-master.redis.svc -a "$(kubectl get secret redis-secret -n red
 2. quorum=2 选举新 master → 5-10s
 3. slave 自动 SLAVEOF 新 master
 4. 旧 master 恢复 → startup.sh 问 sentinel → 发现非己 → 自动变 slave
-5. readinessProbe → 新 master Ready → redis-master.svc 切流量
+5. role-tagger sidecar → 更新 pod label → redis-master.svc 切流量 (~5s)
 ```
 
 ## 监控 (Prometheus)
