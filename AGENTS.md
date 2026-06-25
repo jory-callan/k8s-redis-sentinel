@@ -110,23 +110,13 @@
 
 ## 文件角色
 
-### 根目录（原生 YAML 方式）
+### 根目录
 
 | 文件 | 用途 |
 |------|------|
-| `00-namespace.yaml` | namespace `redis` |
-| `01-secret.yaml` | 密码（可选，删除即降级为无密码） |
-| `02-configmap-redis.yaml` | redis.conf + startup.sh |
-| `03-configmap-sentinel.yaml` | entrypoint.sh |
-| `04-services.yaml` | 6 个 Service |
-| `05-statefulset-redis.yaml` | Redis 3 副本（Parallel + PVC + role-tagger sidecar） |
-| `06-statefulset-sentinel.yaml` | Sentinel 3 副本（Parallel） |
-| `07-pdb.yaml` | 2 个 PDB（minAvailable:2） |
-| `08-rbac.yaml` | role-tagger sidecar 的 RBAC |
-| `install.sh` | 生产部署脚本 |
-| `test.sh` | 测试套件（deploy/verify/failover/cleanup） |
-| `check.sh` | 集群状态检测 |
-| `cleanup.sh` | 交互式清理 |
+| `test.sh` | 测试脚本（基于 Helm，支持 full/install/verify/failover/stability/cleanup） |
+| `README.md` | 项目说明 |
+| `AGENTS.md` | 本文件（给 AI 协作者参考） |
 
 ### Helm Chart（`helm/redis-sentinel/`）
 

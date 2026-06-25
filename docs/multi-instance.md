@@ -34,7 +34,6 @@
 
 K8s 资源名最长 63 字符。Pod 名 = `<instance>-sentinel-0`（最长后缀 12 字符），故实例名最长 **42 字符**。
 
-- `install.sh` 会自动校验长度
 - Helm Chart 不强制校验，但超长会导致 K8s API 拒绝
 
 ## 实例命名建议
@@ -66,8 +65,12 @@ helm install order ./helm/redis-sentinel -n redis \
 ### 脚本方式
 
 ```bash
-./install.sh redis-saas-log
-./install.sh redis-order
+# 部署 + 验证 + failover + 清理
+./test.sh redis-saas-log
+./test.sh redis-order
+
+# 仅部署
+./test.sh redis-saas-log redis install
 ```
 
 ## 自定义 Service
