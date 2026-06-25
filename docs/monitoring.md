@@ -9,9 +9,45 @@
 | `<instance>-exporter` | 9121 | Redis 指标 |
 | `<instance>-sentinel-exporter` | 9121 | Sentinel 指标 |
 
-## Prometheus 抓取配置
+## 内置监控模板（推荐）
 
-### 方式 1: 静态配置
+Chart 已内置 `ServiceMonitor` + `PrometheusRule`（需 Prometheus Operator，CRD `monitoring.coreos.com/v1`），开箱即用：
+
+```bash
+helm install my-app ./helm/redis-sentinel -n redis \
+  --set common.instanceName=my-app \
+  --set common.auth.password=secret \
+  --set monitoring.enabled=true \
+  --set monitoring.alerts.enabled=true
+```
+
+启用后自动创建：
+- **ServiceMonitor**：让 Prometheus Operator 自动发现并抓取 `<instance>-exporter` 和 `<instance>-sentinel-exporter`（端口 metrics，间隔 15s）
+- **PrometheusRule**：11 条关键告警规则（见下表）
+
+`monitoring.alerts.namespace` 留空时 PrometheusRule 创建到 release 所在 namespace；若 Prometheus 只从特定 namespace 选规则，需显式指定。
+
+### 内置告警规则
+
+| Alert | 触发条件 | 严重度 |
+|-------|---------|--------|
+| RedisDown | `redis_up == 0` 持续 1m | critical |
+| RedisNoMaster | `count(redis_instance_info{role="master"}) == 0` 持续 1m | critical |
+| RedisMultipleMasters | `count(redis_instance_info{role="master"}) > 1` 持续 30s | critical（脑裂） |
+| RedisInsufficientSlaves | `max(redis_connected_slaves) < 2` 持续 2m | warning |
+| RedisInsufficientSentinels | `max(redis_sentinel_sentinels) < 2` 持续 2m | warning |
+| RedisMasterDown | `max(redis_sentinel_master_status) == 0` 持续 30s | critical |
+| RedisMemoryHigh | `used/max > 0.9`（仅 maxmemory>0）持续 5m | warning |
+| RedisReplicationBroken | `redis_master_link_up == 0` 持续 2m | warning |
+| RedisRejectedConnections | `rate(redis_rejected_connections_total[5m]) > 0` 持续 5m | warning |
+| RedisEvictingKeys | `rate(redis_evicted_keys_total[5m]) > 0` 持续 5m | warning |
+| RedisBgSaveFailed | `redis_rdb_last_bgsave_status != 0` 持续 1m | warning |
+
+每条告警带 `instance: <instanceName>` 标签，方便多实例区分路由。
+
+## 静态抓取（无 Prometheus Operator 时）
+
+若集群未部署 Prometheus Operator，用静态配置抓取：
 
 ```yaml
 scrape_configs:
@@ -20,33 +56,12 @@ scrape_configs:
       - role: endpoints
     relabel_configs:
       - source_labels: [__meta_kubernetes_service_name]
-        regex: '.*-exporter'        # 匹配所有实例的 exporter
+        regex: '.*-exporter'
         action: keep
       - source_labels: [__meta_kubernetes_namespace]
         regex: 'redis'
         action: keep
     metrics_path: /metrics
-```
-
-### 方式 2: ServiceMonitor（Prometheus Operator）
-
-```yaml
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: redis-sentinel
-  namespace: redis
-spec:
-  selector:
-    matchExpressions:
-      - key: app
-        operator: Exists
-  namespaceSelector:
-    matchNames:
-      - redis
-  endpoints:
-    - port: metrics
-      interval: 15s
 ```
 
 ## 关键指标
@@ -71,67 +86,6 @@ spec:
 | `redis_sentinel_master_address` | master 地址 | 变化告警 |
 | `redis_sentinel_slaves` | slave 数 | <2 告警 |
 | `redis_sentinel_sentinels` | sentinel 数 | <2 告警 |
-
-## 告警规则示例
-
-```yaml
-groups:
-  - name: redis-sentinel
-    rules:
-      # master 不唯一
-      - alert: RedisMultipleMasters
-        expr: count(redis_instance_info{role="master"}) > 1
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Multiple Redis masters detected (possible split-brain)"
-
-      # 无 master
-      - alert: RedisNoMaster
-        expr: count(redis_instance_info{role="master"}) == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "No Redis master"
-
-      # slave 数量不足
-      - alert: RedisInsufficientSlaves
-        expr: redis_sentinel_slaves < 2
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Redis has fewer than 2 slaves"
-
-      # sentinel 数量不足
-      - alert: RedisInsufficientSentinels
-        expr: redis_sentinel_sentinels < 2
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Redis Sentinel quorum at risk"
-
-      # master down
-      - alert: RedisMasterDown
-        expr: redis_sentinel_master_status == 0
-        for: 30s
-        labels:
-          severity: critical
-        annotations:
-          summary: "Redis master is down according to sentinel"
-
-      # 内存使用高
-      - alert: RedisMemoryHigh
-        expr: redis_used_memory_bytes / redis_memory_max_bytes > 0.9
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Redis memory usage > 90%"
-```
 
 ## Grafana Dashboard
 

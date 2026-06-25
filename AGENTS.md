@@ -132,7 +132,9 @@
 | `templates/statefulset-redis.yaml` | Redis StatefulSet |
 | `templates/statefulset-sentinel.yaml` | Sentinel StatefulSet |
 | `templates/pdb.yaml` | 2 个 PDB |
-| `templates/rbac.yaml` | role-tagger RBAC |
+| `templates/rbac.yaml` | role-tagger RBAC（resourceNames 限当前实例 3 pod，仅 get/patch） |
+| `templates/networkpolicy.yaml` | NetworkPolicy（可选，限同实例+业务 pod+Prometheus 入站） |
+| `templates/servicemonitor.yaml` | ServiceMonitor + PrometheusRule（可选，11 条告警） |
 | `templates/NOTES.txt` | 部署后提示 |
 
 ### 文档（`docs/`）
@@ -145,6 +147,7 @@
 | `helm.md` | Helm Chart 使用与配置 |
 | `monitoring.md` | Prometheus 监控配置 |
 | `production.md` | 生产就绪评估 |
+| `production-drills.md` | 生产故障演练清单（节点 drain/网络分区/多数派丢失等） |
 | `attempts.md` | 设计演进与尝试路径 |
 | `pitfalls.md` | 踩坑记录与解决方案 |
 

@@ -48,6 +48,12 @@ redis:
     #   cpu: 500m
     #   memory: 512Mi
 
+  # 内存上限与淘汰策略 (生产建议显式设置, 默认 0=不限制)
+  # maxmemory: "512mb"              # 例: 512mb / 1gb / 0
+  # maxmemoryPolicy: "allkeys-lru"  # noeviction(默认) | allkeys-lru | volatile-lru | allkeys-lfu ...
+  maxmemory: "0"
+  maxmemoryPolicy: "noeviction"
+
   # 持久化存储
   persistence:
     enabled: true
@@ -183,3 +189,77 @@ service:
 pdb:
   enabled: true
   minAvailable: 2
+
+# ── NetworkPolicy ─────────────────────────────────────────────
+# 限制 Redis/Sentinel pod 入站流量 (egress 默认放行)
+# 启用后: 仅同实例 pod + redisIngressFrom 配置的业务 pod + Prometheus 可访问
+networkPolicy:
+  enabled: false
+  # 允许访问 6379 的业务来源 (跨 namespace)
+  # 空数组 = 只允许同 namespace 内同实例 pod
+  # 每项: { namespace: <ns>, podSelector: {<label>: <value>} }
+  # podSelector 可省略 (留空 = 整个 namespace 的 pod)
+  redisIngressFrom: []
+  # 例:
+  # - namespace: app
+  #   podSelector:
+  #     app: web
+  # - namespace: middleware
+  # Prometheus 所在 namespace (用于抓取 9121 metrics)
+  # 留空 = 不允许跨 namespace 抓取 (仅同 namespace)
+  prometheusNamespace: "monitoring"
+
+# ── Prometheus 监控 (ServiceMonitor + PrometheusRule) ────────
+# 需要 Prometheus Operator (CRD: monitoring.coreos.com/v1)
+monitoring:
+  enabled: false
+  # ServiceMonitor 抓取间隔
+  interval: 15s
+  # PrometheusRule 告警规则 (启用时自动创建关键告警)
+  alerts:
+    enabled: true
+    # 告警发送到的 namespace (PrometheusRule 资源所在 ns)
+    namespace: ""
+
+# ── 备份 (CronJob → MinIO/S3) ────────────────────────────────
+# 定时从 master 拉取 RDB 快照上传到对象存储
+# 原理: redis-cli --rdb 通过复制协议拉 RDB (触发 master fork, 不挂 PVC)
+backup:
+  enabled: false
+  # MinIO/S3 上传镜像 (需含 mc)
+  image:
+    repository: minio/mc
+    tag: "RELEASE.2024-01-11T05-49-32Z"
+    pullPolicy: IfNotPresent
+  # RDB 拉取镜像 (需含 redis-cli)
+  dumperImage:
+    repository: redis
+    tag: "5.0.8"
+    pullPolicy: IfNotPresent
+  # Cron 调度 (默认每天 02:00)
+  schedule: "0 2 * * *"
+  # 并发控制: 上一次未完成则跳过
+  concurrencyPolicy: Forbid
+  # 保留历史 Job 数
+  historyLimit: 3
+  # MinIO/S3 配置
+  endpoint: "http://minio.minio.svc.cluster.local:80"
+  # 外部 https 端点用自签名证书时设 true (集群内 http 无需)
+  insecure: false
+  bucket: "redis-test"
+  # 备份在 bucket 下的子路径前缀 (默认用 instanceName 自动隔离多实例)
+  prefix: ""
+  region: "us-east-1"
+  # 凭证 (生产建议用 existingSecret)
+  accessKey: "minioadmin"
+  secretKey: "minioadmin"
+  # 使用已存在的 Secret (优先于 accessKey/secretKey)
+  # 需含 key: access-key, secret-key
+  existingSecret: ""
+  # 保留天数 (超过自动删除)
+  retentionDays: 7
+  # 资源
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi

@@ -52,6 +52,17 @@
 {{- end -}}
 
 {{/*
+  Backup Secret 名称 (existingSecret 优先)
+*/}}
+{{- define "redis-sentinel.backupSecretName" -}}
+{{- if .Values.backup.existingSecret -}}
+{{- .Values.backup.existingSecret -}}
+{{- else -}}
+{{- include "redis-sentinel.instanceName" . -}}-backup-secret
+{{- end -}}
+{{- end -}}
+
+{{/*
   通用 labels
 */}}
 {{- define "redis-sentinel.labels" -}}

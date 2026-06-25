@@ -1,0 +1,118 @@
+{{- if .Values.networkPolicy.enabled }}
+# ──────────────────────────────────────────────────────────────
+# NetworkPolicy — 限制 Redis/Sentinel pod 的入站流量
+#
+# 默认策略: deny all ingress, 仅放行:
+#   - 6379: 同实例 redis/sentinel pod (复制/sentinel监控/role-tagger)
+#           + 业务 pod (networkPolicy.redisIngressFrom 配置)
+#   - 26379: 同实例 redis pod (startup 查询) + sentinel pod (sentinel 互连)
+#   - 9121: Prometheus namespace 抓取 + 同 namespace (本地测试)
+#
+# 不影响出站 (egress 默认全放行)
+# ──────────────────────────────────────────────────────────────
+
+# Redis pod NetworkPolicy
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "redis-sentinel.redisName" . }}-np
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app: {{ include "redis-sentinel.redisName" . }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ include "redis-sentinel.redisName" . }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # 6379: 同实例 redis + sentinel pod (复制 / sentinel 监控 / role-tagger localhost 不受限)
+    - from:
+        - podSelector:
+            matchLabels:
+              app: {{ include "redis-sentinel.redisName" . }}
+        - podSelector:
+            matchLabels:
+              app: {{ include "redis-sentinel.sentinelName" . }}
+      ports:
+        - port: 6379
+          protocol: TCP
+    # 6379: 业务 pod (来自 redisIngressFrom, 跨 namespace)
+    {{- if .Values.networkPolicy.redisIngressFrom }}
+    - from:
+        {{- range .Values.networkPolicy.redisIngressFrom }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .namespace | quote }}
+          {{- if .podSelector }}
+          podSelector:
+            matchLabels:
+              {{- range $k, $v := .podSelector }}
+              {{ $k }}: {{ $v | quote }}
+              {{- end }}
+          {{- end }}
+        {{- end }}
+      ports:
+        - port: 6379
+          protocol: TCP
+    {{- end }}
+    # 9121: Prometheus 抓取 (exporter)
+    {{- if .Values.redis.exporter.enabled }}
+    - from:
+        # 同 namespace (本地测试 / 单 namespace 部署)
+        - podSelector: {}
+        {{- if .Values.networkPolicy.prometheusNamespace }}
+        # Prometheus 所在 namespace
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.prometheusNamespace | quote }}
+        {{- end }}
+      ports:
+        - port: 9121
+          protocol: TCP
+    {{- end }}
+
+# Sentinel pod NetworkPolicy
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "redis-sentinel.sentinelName" . }}-np
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app: {{ include "redis-sentinel.sentinelName" . }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ include "redis-sentinel.sentinelName" . }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # 26379: 同实例 redis pod (startup.sh 查询 master) + sentinel pod (sentinel 互连/选举)
+    - from:
+        - podSelector:
+            matchLabels:
+              app: {{ include "redis-sentinel.redisName" . }}
+        - podSelector:
+            matchLabels:
+              app: {{ include "redis-sentinel.sentinelName" . }}
+      ports:
+        - port: 26379
+          protocol: TCP
+    # 9121: Prometheus 抓取 (exporter)
+    {{- if .Values.sentinel.exporter.enabled }}
+    - from:
+        - podSelector: {}
+        {{- if .Values.networkPolicy.prometheusNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.prometheusNamespace | quote }}
+        {{- end }}
+      ports:
+        - port: 9121
+          protocol: TCP
+    {{- end }}
+{{- end }}

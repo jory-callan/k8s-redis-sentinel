@@ -18,6 +18,8 @@ data:
     {{- range .Values.redis.config }}
     {{ . }}
     {{- end }}
+    maxmemory {{ .Values.redis.maxmemory }}
+    maxmemory-policy {{ .Values.redis.maxmemoryPolicy }}
 
   startup.sh: |
     #!/bin/sh

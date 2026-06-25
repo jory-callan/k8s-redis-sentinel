@@ -31,19 +31,49 @@
 - sentinel 全挂：不影响运行，只影响 failover 能力
 - RBAC 最小权限：只能 patch 当前实例的 3 个 redis pod，无法 list/update/操作其他 pod
 
-**但还不能直接投入生产**，存在以下不足：
+**生产就绪进展**（除备份外已补齐关键项）：
 
-| 类别 | 问题 | 风险 |
+| 类别 | 状态 | 说明 |
 |------|------|------|
-| 版本 | Redis 5.0.8（2019），有已知 CVE | 安全风险 |
-| 测试覆盖 | 只在 k3s 单节点测过，未测节点宕机/网络分区/磁盘满 | 生产场景未验证 |
-| 备份 | 无外部备份机制（RDB/AOF 只在 PVC 内） | PVC 丢失=数据丢失 |
-| 监控 | 只有 metrics 暴露，无 ServiceMonitor/PrometheusRule/告警 | 故障无感知 |
-| 密码 | values.yaml 明文密码 | 应用 externalSecret + KMS |
-| 网络 | 无 NetworkPolicy | 任意 pod 可访问 |
-| PVC | Helm uninstall 不删 PVC（K8s 默认） | 残留资源 |
+| 监控告警 | ✅ 已完成 | Chart 内置 `ServiceMonitor` + `PrometheusRule`（11 条告警），`monitoring.enabled=true` 即启用，详见 [monitoring.md](monitoring.md) |
+| 网络隔离 | ✅ 已完成 | Chart 内置 `NetworkPolicy` 模板，`networkPolicy.enabled=true` 即启用，仅放行同实例 pod + 配置的业务 pod + Prometheus 抓取 |
+| 内存上限 | ✅ 已完成 | `redis.maxmemory` + `redis.maxmemoryPolicy` 可配置，防 OOM；`check.sh` 显示使用率并 >80% 告警 |
+| 密码 | ✅ 保留现状 | `password` 明文 / `existingSecret` 两种方式均可用（按需选择） |
+| 备份 | ⏳ 待实现 | 待 MinIO 部署后接入（RDB 定时备份到对象存储） |
+| 版本 | ⚠️ 评估 | Redis 5.0.8（项目非目标锁定 5.0.x，需评估可接受 CVE） |
+| 演练覆盖 | ⚠️ 待补 | k3s 多节点已测，生产节点 drain/网络分区演练见 [production-drills.md](production-drills.md) |
+| PVC | ⚠️ 保留 | K8s 默认 `helm uninstall` 不删 PVC（防误删）；`install.sh uninstall --purge` 可彻底清理 |
 
-**建议**：上生产前至少补齐备份、监控告警、NetworkPolicy，并做多节点故障演练。
+**建议**：补齐备份后即可承接生产负载；上核心业务前按 [production-drills.md](production-drills.md) 做节点级故障演练。
+
+## 生产推荐配置
+
+```bash
+helm install my-app ./helm/redis-sentinel -n redis \
+  --set common.instanceName=my-app \
+  --set common.auth.password=<强密码> \
+  --set redis.maxmemory=1gb \
+  --set redis.maxmemoryPolicy=allkeys-lru \
+  --set networkPolicy.enabled=true \
+  --set 'networkPolicy.redisIngressFrom[0].namespace=app' \
+  --set 'networkPolicy.redisIngressFrom[0].podSelector.app=web' \
+  --set monitoring.enabled=true \
+  --set monitoring.alerts.enabled=true
+```
+
+或在 `values.yaml` 自定义后 `helm install my-app ./helm/redis-sentinel -f my-values.yaml`。
+
+### 关键参数说明
+
+| 参数 | 生产建议 | 说明 |
+|------|---------|------|
+| `redis.maxmemory` | `1gb`（按业务） | 设上限防 OOM，`0` = 无限制（不推荐生产） |
+| `redis.maxmemoryPolicy` | `allkeys-lru` | 全键 LRU 淘汰，`noeviction` 满了直接拒绝写入 |
+| `networkPolicy.enabled` | `true` | 限制 6379/26379 仅授权来源访问 |
+| `networkPolicy.redisIngressFrom` | 业务 namespace | 允许哪些 pod 访问 Redis |
+| `monitoring.enabled` | `true` | 需 Prometheus Operator |
+| `monitoring.alerts.enabled` | `true` | 11 条关键告警 |
+| `common.podAntiAffinity` | `true`（默认） | pod 跨节点分散（preferred） |
 
 ## role-tagger 切换机制
 

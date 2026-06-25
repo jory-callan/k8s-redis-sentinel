@@ -1,0 +1,175 @@
+{{- if .Values.monitoring.enabled }}
+# ──────────────────────────────────────────────────────────────
+# Prometheus Operator 监控资源 (ServiceMonitor + PrometheusRule)
+# 需要 CRD: monitoring.coreos.com/v1 (Prometheus Operator)
+# ──────────────────────────────────────────────────────────────
+
+# ServiceMonitor: 让 Prometheus 自动发现并抓取 exporter
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "redis-sentinel.instanceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - {{ include "redis-sentinel.redisName" . }}
+          - {{ include "redis-sentinel.sentinelName" . }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.monitoring.interval | quote }}
+      path: /metrics
+      # 带密码抓取 (exporter 通过 REDIS_PASSWORD env 连接)
+      {{- if .Values.common.auth.enabled }}
+      params:
+        password:
+          - {{ include "redis-sentinel.secretName" . | quote }}
+      {{- end }}
+
+{{- if .Values.monitoring.alerts.enabled }}
+# PrometheusRule: 关键告警规则
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "redis-sentinel.instanceName" . }}-alerts
+  {{- $ruleNs := .Values.monitoring.alerts.namespace | default .Release.Namespace }}
+  namespace: {{ $ruleNs }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: redis-sentinel-{{ include "redis-sentinel.instanceName" . }}
+      rules:
+        # ── Redis 实例存活 ──────────────────────────────
+        - alert: RedisDown
+          expr: redis_up == 0
+          for: 1m
+          labels:
+            severity: critical
+            instance: {{ include "redis-sentinel.instanceName" . }}
+          annotations:
+            summary: "Redis 实例宕机"
+            description: "Redis exporter 无法连接 Redis (redis_up=0), 持续 1m"
+
+        # ── 无 master (写不可用) ────────────────────────
+        - alert: RedisNoMaster
+          expr: count(redis_instance_info{role="master"}) == 0
+          for: 1m
+          labels:
+            severity: critical
+            instance: {{ include "redis-sentinel.instanceName" . }}
+          annotations:
+            summary: "无 Redis master, 写入不可用"
+            description: "全集群无 master 角色实例, 写流量将全部失败"
+
+        # ── 多 master (脑裂) ─────────────────────────────
+        - alert: RedisMultipleMasters
+          expr: count(redis_instance_info{role="master"}) > 1
+          for: 30s
+          labels:
+            severity: critical
+            instance: {{ include "redis-sentinel.instanceName" . }}
+          annotations:
+            summary: "检测到多个 master (疑似脑裂)"
+            description: "集群出现 >1 个 master, 可能发生脑裂, 立即排查"
+
+        # ── slave 不足 (无 failover 候选) ───────────────
+        - alert: RedisInsufficientSlaves
+          expr: max(redis_connected_slaves) < 2
+          for: 2m
+          labels:
+            severity: warning
+            instance: {{ include "redis-sentinel.instanceName" . }}
+          annotations:
+            summary: "Redis slave 数量不足"
+            description: "master 的 connected_slaves < 2, failover 后无法保证高可用"
+
+        # ── sentinel 数量不足 (quorum 风险) ─────────────
+        - alert: RedisInsufficientSentinels
+          expr: max(redis_sentinel_sentinels) < 2
+          for: 2m
+          labels:
+            severity: warning
+            instance: {{ include "redis-sentinel.instanceName" . }}
+          annotations:
+            summary: "Redis Sentinel 数量不足"
+            description: "可用 sentinel < 2, quorum=2 无法达成, 无法 failover"
+
+        # ── sentinel 认为 master 宕机 ───────────────────
+        - alert: RedisMasterDown
+          expr: max(redis_sentinel_master_status) == 0
+          for: 30s
+          labels:
+            severity: critical
+            instance: {{ include "redis-sentinel.instanceName" . }}
+          annotations:
+            summary: "Sentinel 判定 master 宕机"
+            description: "sentinel 报告 master 状态为 down, failover 可能进行中或失败"
+
+        # ── 内存使用高 ──────────────────────────────────
+        # 仅当 maxmemory>0 时有意义 (maxmemory=0 时不触发)
+        - alert: RedisMemoryHigh
+          expr: (redis_memory_max_bytes > 0) and (redis_used_memory_bytes / redis_memory_max_bytes > 0.9)
+          for: 5m
+          labels:
+            severity: warning
+            instance: {{ include "redis-sentinel.instanceName" . }}
+          annotations:
+            summary: "Redis 内存使用率 > 90%"
+            description: "内存接近 maxmemory, 可能即将触发淘汰或拒绝写入"
+
+        # ── 复制断开 (slave 与 master 失联) ─────────────
+        - alert: RedisReplicationBroken
+          expr: redis_master_link_up == 0
+          for: 2m
+          labels:
+            severity: warning
+            instance: {{ include "redis-sentinel.instanceName" . }}
+          annotations:
+            summary: "Redis slave 复制链路断开"
+            description: "slave 的 master_link_status=down, 数据不同步"
+
+        # ── 拒绝连接数上升 ──────────────────────────────
+        - alert: RedisRejectedConnections
+          expr: rate(redis_rejected_connections_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            instance: {{ include "redis-sentinel.instanceName" . }}
+          annotations:
+            summary: "Redis 有连接被拒绝"
+            description: "rejected_connections 持续上升, 可能达到 maxclients 或客户端用错密码"
+
+        # ── key 被淘汰 (内存压力) ───────────────────────
+        - alert: RedisEvictingKeys
+          expr: rate(redis_evicted_keys_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            instance: {{ include "redis-sentinel.instanceName" . }}
+          annotations:
+            summary: "Redis 正在淘汰 key"
+            description: "evicted_keys 上升, 内存不足已触发淘汰策略"
+
+        # ── RDB 持久化失败 ──────────────────────────────
+        - alert: RedisBgSaveFailed
+          expr: redis_rdb_last_bgsave_status != 0
+          for: 1m
+          labels:
+            severity: warning
+            instance: {{ include "redis-sentinel.instanceName" . }}
+          annotations:
+            summary: "Redis RDB bgsave 失败"
+            description: "rdb_last_bgsave_status 非 0, 持久化可能异常 (磁盘满/权限)"
+{{- end }}
+{{- end }}
