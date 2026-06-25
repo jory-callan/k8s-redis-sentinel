@@ -1,114 +1,122 @@
 # ──────────────────────────────────────────────────────────────
 # All Services for Redis-Sentinel cluster
+#
+# Naming convention (instance = __INSTANCE_NAME__):
+#   __INSTANCE_NAME__-hl              Headless (redis pods)
+#   __INSTANCE_NAME__-master           ClusterIP (write, routes to master only)
+#   __INSTANCE_NAME__-read             ClusterIP (read, routes to all pods)
+#   __INSTANCE_NAME__-exporter         ClusterIP (redis metrics)
+#   __INSTANCE_NAME__-sentinel-hl      Headless (sentinel pods)
+#   __INSTANCE_NAME__-sentinel-exporter ClusterIP (sentinel metrics)
+#
+# Need NodePort/LoadBalancer? Create your own Service with the same selector.
 # ──────────────────────────────────────────────────────────────
 
-# redis-hl: Headless, stable per-pod DNS (redis-0.redis-hl, redis-1, ...)
+# __INSTANCE_NAME__-hl: Headless, stable per-pod DNS (__INSTANCE_NAME__-0.__INSTANCE_NAME__-hl, ...)
 # publishNotReadyAddresses=true so slaves (NotReady) are also resolvable
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: redis-hl
-  namespace: redis
+  name: __INSTANCE_NAME__-hl
+  namespace: __NAMESPACE__
   labels:
-    app: redis
+    app: __INSTANCE_NAME__
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector:
-    app: redis
+    app: __INSTANCE_NAME__
   ports:
     - name: redis
       port: 6379
 
-# redis-master: NodePort :30001, routes ONLY to master
+# __INSTANCE_NAME__-master: ClusterIP, routes ONLY to master
 # (sidecar role-tagger sets redis-role=master on master pod → Service routes to it)
 # This replaces readinessProbe=ROLE=master to avoid storm of probe-failure events.
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: redis-master
-  namespace: redis
+  name: __INSTANCE_NAME__-master
+  namespace: __NAMESPACE__
   labels:
-    app: redis
+    app: __INSTANCE_NAME__
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
-    app: redis
+    app: __INSTANCE_NAME__
     redis-role: master
   ports:
     - name: redis
       port: 6379
       targetPort: 6379
-      nodePort: 30001
 
-# redis-read: NodePort :30002, routes to ALL pods (master + slaves)
+# __INSTANCE_NAME__-read: ClusterIP, routes to ALL pods (master + slaves)
 # publishNotReadyAddresses=true so slaves receive read traffic too
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: redis-read
-  namespace: redis
+  name: __INSTANCE_NAME__-read
+  namespace: __NAMESPACE__
   labels:
-    app: redis
+    app: __INSTANCE_NAME__
 spec:
-  type: NodePort
+  type: ClusterIP
   publishNotReadyAddresses: true
   selector:
-    app: redis
+    app: __INSTANCE_NAME__
   ports:
     - name: redis
       port: 6379
       targetPort: 6379
-      nodePort: 30002
 
-# sentinel-hl: Headless, stable per-pod DNS (sentinel-0.sentinel-hl, ...)
+# __INSTANCE_NAME__-sentinel-hl: Headless, stable per-pod DNS
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: sentinel-hl
-  namespace: redis
+  name: __INSTANCE_NAME__-sentinel-hl
+  namespace: __NAMESPACE__
   labels:
-    app: sentinel
+    app: __INSTANCE_NAME__-sentinel
 spec:
   clusterIP: None
   selector:
-    app: sentinel
+    app: __INSTANCE_NAME__-sentinel
   ports:
     - name: sentinel
       port: 26379
 
-# redis-exporter: Prometheus metrics for Redis
+# __INSTANCE_NAME__-exporter: Prometheus metrics for Redis
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: redis-exporter
-  namespace: redis
+  name: __INSTANCE_NAME__-exporter
+  namespace: __NAMESPACE__
   labels:
-    app: redis
+    app: __INSTANCE_NAME__
 spec:
   selector:
-    app: redis
+    app: __INSTANCE_NAME__
   ports:
     - name: metrics
       port: 9121
 
-# sentinel-exporter: Prometheus metrics for Sentinel
+# __INSTANCE_NAME__-sentinel-exporter: Prometheus metrics for Sentinel
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: sentinel-exporter
-  namespace: redis
+  name: __INSTANCE_NAME__-sentinel-exporter
+  namespace: __NAMESPACE__
   labels:
-    app: sentinel
+    app: __INSTANCE_NAME__-sentinel
 spec:
   selector:
-    app: sentinel
+    app: __INSTANCE_NAME__-sentinel
   ports:
     - name: metrics
       port: 9121

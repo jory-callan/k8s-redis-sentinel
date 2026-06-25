@@ -1,25 +1,25 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: redis
-  namespace: redis
+  name: __INSTANCE_NAME__
+  namespace: __NAMESPACE__
 spec:
-  serviceName: redis-hl
+  serviceName: __INSTANCE_NAME__-hl
   replicas: 3
   # Parallel: all pods start simultaneously
   # Split-brain prevention is in startup.sh (ordinal>0 never self-promotes)
   podManagementPolicy: Parallel
   selector:
     matchLabels:
-      app: redis
+      app: __INSTANCE_NAME__
   template:
     metadata:
       labels:
-        app: redis
+        app: __INSTANCE_NAME__
         # Initial label; role-tagger sidecar updates it every 5s based on ROLE.
         redis-role: slave
     spec:
-      serviceAccountName: redis-role-tagger
+      serviceAccountName: __INSTANCE_NAME__-role-tagger
       terminationGracePeriodSeconds: 30
       affinity:
         podAntiAffinity:
@@ -28,7 +28,7 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: redis
+                    app: __INSTANCE_NAME__
                 topologyKey: kubernetes.io/hostname
       containers:
         # ── Redis 5.0.8 ──────────────────────────────────
@@ -45,6 +45,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: INSTANCE_NAME
+              value: __INSTANCE_NAME__
             - name: POD_IP
               valueFrom:
                 fieldRef:
@@ -52,7 +54,7 @@ spec:
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: redis-secret
+                  name: __INSTANCE_NAME__-secret
                   key: redis-password
                   optional: true
           # startupProbe: generous timeout for cold start (150s)
@@ -69,7 +71,7 @@ spec:
             failureThreshold: 30
           # readinessProbe: PING (health check only).
           # Master routing is handled by redis-role label (set by role-tagger sidecar)
-          # and redis-master.svc selector redis-role=master.
+          # and __INSTANCE_NAME__-master.svc selector redis-role=master.
           # This avoids storm of probe-failure events on slaves.
           readinessProbe:
             exec:
@@ -116,7 +118,7 @@ spec:
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: redis-secret
+                  name: __INSTANCE_NAME__-secret
                   key: redis-password
                   optional: true
           resources:
@@ -126,9 +128,9 @@ spec:
 
         # ── role-tagger sidecar ───────────────────────────
         # Polls redis_exporter metrics every 5s for role, patches pod label
-        # redis-role=master|slave. redis-master.svc selector uses redis-role=master
-        # → routes only to master. Replaces readinessProbe=ROLE=master (which
-        # caused storm of failure events on slaves).
+        # redis-role=master|slave. __INSTANCE_NAME__-master.svc selector uses
+        # redis-role=master → routes only to master. Replaces readinessProbe=ROLE=master
+        # (which caused storm of failure events on slaves).
         # Uses curlimages/curl (lightweight, ~4MB) — no kubectl/redis-cli needed.
         - name: role-tagger
           image: curlimages/curl:7.88.1
@@ -209,7 +211,7 @@ spec:
       volumes:
         - name: conf
           configMap:
-            name: redis-config
+            name: __INSTANCE_NAME__-config
             defaultMode: 0755
 
   # ── PVC: persistent storage (production) ──────────────

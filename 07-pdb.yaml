@@ -5,21 +5,21 @@
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: redis-pdb
-  namespace: redis
+  name: __INSTANCE_NAME__-pdb
+  namespace: __NAMESPACE__
 spec:
   minAvailable: 2
   selector:
     matchLabels:
-      app: redis
+      app: __INSTANCE_NAME__
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: sentinel-pdb
-  namespace: redis
+  name: __INSTANCE_NAME__-sentinel-pdb
+  namespace: __NAMESPACE__
 spec:
   minAvailable: 2
   selector:
     matchLabels:
-      app: sentinel
+      app: __INSTANCE_NAME__-sentinel

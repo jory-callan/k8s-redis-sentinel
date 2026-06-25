@@ -1,8 +1,8 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: sentinel-config
-  namespace: redis
+  name: __INSTANCE_NAME__-sentinel-config
+  namespace: __NAMESPACE__
 data:
   entrypoint.sh: |
     #!/bin/sh
@@ -10,9 +10,14 @@ data:
     # No 'set -e' (dash compatibility, see PITFALLS.md #1)
 
     NAMESPACE="${NAMESPACE:-redis}"
+    INSTANCE_NAME="${INSTANCE_NAME:-redis}"
     MY_IP="${POD_IP:-$(hostname -i | awk '{print $1}')}"
 
-    echo "[sentinel] ip=${MY_IP}"
+    # Derived names (must match 04-services.yaml)
+    REDIS_HL="${INSTANCE_NAME}-hl"
+    SENTINEL_HL="${INSTANCE_NAME}-sentinel-hl"
+
+    echo "[sentinel] instance=${INSTANCE_NAME} ip=${MY_IP}"
 
     # ── Helper: redis-cli with optional auth ──────────
     # NOTE: 'timeout' wraps redis-cli (external cmd), NOT a shell function (PITFALLS.md #12)
@@ -28,8 +33,8 @@ data:
     # ── Find master: ask other sentinels, then scan redis pods ──
     find_master() {
       # 1. Ask other sentinels
-      for s in sentinel-0 sentinel-1 sentinel-2; do
-        H="${s}.sentinel-hl.${NAMESPACE}.svc"
+      for s in ${INSTANCE_NAME}-sentinel-0 ${INSTANCE_NAME}-sentinel-1 ${INSTANCE_NAME}-sentinel-2; do
+        H="${s}.${SENTINEL_HL}.${NAMESPACE}.svc"
         IP="$(cli -h "${H}" -p 26379 SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -1)"
         if [ -n "${IP}" ] && [ "${IP}" != "nil" ]; then
           # Verify the master IP is actually reachable (not a stale entry
@@ -41,8 +46,8 @@ data:
         fi
       done
       # 2. Scan redis pods for ROLE=master
-      for r in redis-0 redis-1 redis-2; do
-        H="${r}.redis-hl.${NAMESPACE}.svc"
+      for r in ${INSTANCE_NAME}-0 ${INSTANCE_NAME}-1 ${INSTANCE_NAME}-2; do
+        H="${r}.${REDIS_HL}.${NAMESPACE}.svc"
         ROLE="$(cli -h "${H}" -p 6379 ROLE 2>/dev/null | head -1)"
         if [ "${ROLE}" = "master" ]; then
           IP="$(getent hosts "${H}" 2>/dev/null | awk '{print $1}')"
@@ -66,13 +71,13 @@ data:
 
     # Fallback: redis-0 (cold start default)
     if [ -z "${MASTER_IP}" ]; then
-      echo "[cold] no master found, defaulting to redis-0"
-      MASTER_IP="$(getent hosts "redis-0.redis-hl.${NAMESPACE}.svc" 2>/dev/null | awk '{print $1}')"
+      echo "[cold] no master found, defaulting to ${INSTANCE_NAME}-0"
+      MASTER_IP="$(getent hosts "${INSTANCE_NAME}-0.${REDIS_HL}.${NAMESPACE}.svc" 2>/dev/null | awk '{print $1}')"
       if [ -z "${MASTER_IP}" ]; then
         # redis-0 pod not yet created. Crash and let K8s restart us.
         # Do NOT fallback to 127.0.0.1 — sentinel would monitor itself
         # and never discover the real master (deadlock).
-        echo "[error] cannot resolve redis-0, exiting (will retry on restart)"
+        echo "[error] cannot resolve ${INSTANCE_NAME}-0, exiting (will retry on restart)"
         exit 1
       fi
     fi

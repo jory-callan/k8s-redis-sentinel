@@ -1,8 +1,8 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: redis-config
-  namespace: redis
+  name: __INSTANCE_NAME__-config
+  namespace: __NAMESPACE__
 data:
   redis.conf: |
     port 6379
@@ -40,10 +40,15 @@ data:
     # No 'set -e' (dash + local + $() = silent exit, see PITFALLS.md #1)
 
     NAMESPACE="${NAMESPACE:-redis}"
+    INSTANCE_NAME="${INSTANCE_NAME:-redis}"
     ORDINAL="$(hostname | awk -F- '{print $NF}')"
     MY_IP="${POD_IP:-$(hostname -i | awk '{print $1}')}"
 
-    echo "[startup] ordinal=${ORDINAL} ip=${MY_IP}"
+    # Derived names (must match 04-services.yaml)
+    REDIS_HL="${INSTANCE_NAME}-hl"
+    SENTINEL_HL="${INSTANCE_NAME}-sentinel-hl"
+
+    echo "[startup] instance=${INSTANCE_NAME} ordinal=${ORDINAL} ip=${MY_IP}"
 
     # ── Build redis.conf ──────────────────────────────
     cp /conf/redis.conf /data/redis.conf
@@ -73,8 +78,8 @@ data:
       i=0
       while [ "$i" -lt 5 ]; do
         i=$((i + 1))
-        for s in sentinel-0 sentinel-1 sentinel-2; do
-          H="${s}.sentinel-hl.${NAMESPACE}.svc"
+        for s in ${INSTANCE_NAME}-sentinel-0 ${INSTANCE_NAME}-sentinel-1 ${INSTANCE_NAME}-sentinel-2; do
+          H="${s}.${SENTINEL_HL}.${NAMESPACE}.svc"
           IP="$(cli -h "${H}" -p 26379 SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -1)"
           if [ -n "${IP}" ] && [ "${IP}" != "nil" ]; then
             echo "${IP}"
@@ -134,17 +139,18 @@ data:
     fi
 
     # ordinal > 0: wait for redis-0 (NEVER self-promote — prevents split-brain)
-    echo "[cold] waiting for redis-0 to become master..."
+    REDIS_0="${INSTANCE_NAME}-0.${REDIS_HL}.${NAMESPACE}.svc"
+    echo "[cold] waiting for ${REDIS_0} to become master..."
     i=0
     while [ "$i" -lt 30 ]; do
       i=$((i + 1))
-      if cli -h "redis-0.redis-hl.${NAMESPACE}.svc" -p 6379 PING 2>/dev/null | grep -q PONG; then
-        echo "[role] slave of redis-0 (cold start)"
-        exec redis-server /data/redis.conf --slaveof "redis-0.redis-hl.${NAMESPACE}.svc" 6379
+      if cli -h "${REDIS_0}" -p 6379 PING 2>/dev/null | grep -q PONG; then
+        echo "[role] slave of ${REDIS_0} (cold start)"
+        exec redis-server /data/redis.conf --slaveof "${REDIS_0}" 6379
       fi
       sleep 2
     done
 
     # Cannot reach redis-0 — crash (K8s restarts). Do NOT become standalone master.
-    echo "[error] cannot reach redis-0 after 60s, exiting"
+    echo "[error] cannot reach ${REDIS_0} after 60s, exiting"
     exit 1

@@ -1,19 +1,19 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: sentinel
-  namespace: redis
+  name: __INSTANCE_NAME__-sentinel
+  namespace: __NAMESPACE__
 spec:
-  serviceName: sentinel-hl
+  serviceName: __INSTANCE_NAME__-sentinel-hl
   replicas: 3
   podManagementPolicy: Parallel
   selector:
     matchLabels:
-      app: sentinel
+      app: __INSTANCE_NAME__-sentinel
   template:
     metadata:
       labels:
-        app: sentinel
+        app: __INSTANCE_NAME__-sentinel
     spec:
       terminationGracePeriodSeconds: 30
       affinity:
@@ -23,7 +23,7 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: sentinel
+                    app: __INSTANCE_NAME__-sentinel
                 topologyKey: kubernetes.io/hostname
       containers:
         # ── Redis Sentinel 5.0.8 ────────────────────────
@@ -40,6 +40,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: INSTANCE_NAME
+              value: __INSTANCE_NAME__
             - name: POD_IP
               valueFrom:
                 fieldRef:
@@ -47,7 +49,7 @@ spec:
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: redis-secret
+                  name: __INSTANCE_NAME__-secret
                   key: redis-password
                   optional: true
           # startupProbe: sentinel discovery can take up to 200s
@@ -108,7 +110,7 @@ spec:
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: redis-secret
+                  name: __INSTANCE_NAME__-secret
                   key: redis-password
                   optional: true
           resources:
@@ -119,7 +121,7 @@ spec:
       volumes:
         - name: conf
           configMap:
-            name: sentinel-config
+            name: __INSTANCE_NAME__-sentinel-config
             defaultMode: 0755
         - name: data
           emptyDir: {}
