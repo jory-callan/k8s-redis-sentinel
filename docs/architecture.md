@@ -35,7 +35,7 @@
 |------|------|------|
 | `redis` | `redis:5.0.8` | 运行 Redis 实例，startup.sh 决定 master/slave 角色 |
 | `exporter` | `oliver006/redis_exporter` | 暴露 Prometheus 指标（端口 9121） |
-| `role-tagger` | `curlimages/curl` | 每 5s 轮询 exporter metrics，PATCH pod label `redis-role` |
+| `role-tagger` | `curlimages/curl` | 每 5s 用 curl telnet 直接查 redis ROLE，PATCH pod label `redis-role`（不依赖 exporter） |
 
 ### Sentinel Pod
 
@@ -56,7 +56,9 @@
 
 ### 2. 应用零改动（role-tagger 机制）
 
-`role-tagger` sidecar 每 5s 从 redis_exporter metrics 获取 ROLE，PATCH pod label `redis-role=master|slave`。`<instance>-master.svc` selector 为 `redis-role=master` → 只路由到 master。failover 时 sidecar 更新 label，Service 自动切流量（~5s）。readinessProbe 改为 PING，所有 pod Ready，无事件风暴。
+`role-tagger` sidecar 每 5s 用 `curl telnet://127.0.0.1:6379` 发送 redis 协议（AUTH + INFO replication），直接从 redis 查询 ROLE，PATCH pod label `redis-role=master|slave`。`<instance>-master.svc` selector 为 `redis-role=master` → 只路由到 master。failover 时 sidecar 更新 label，Service 自动切流量（~5s）。readinessProbe 改为 PING，所有 pod Ready，无事件风暴。
+
+**关键**：role-tagger **不依赖 exporter 容器**——直接查 redis，exporter 挂掉不影响标签更新（实测验证）。
 
 **切换流程**（非事件驱动，定时轮询）:
 

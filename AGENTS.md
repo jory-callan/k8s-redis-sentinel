@@ -45,12 +45,14 @@
 **旧方案**: readinessProbe 检查 `ROLE | grep master` → slave NotReady → Service 无 endpoint。
 **问题**: slave 持续产生 `Readiness probe failed` 事件（10 分钟 309 次，1 年数千万次），给 etcd/kubelet/API server 压力。
 **新方案**: role-tagger sidecar + pod label:
-1. `role-tagger` sidecar（`curlimages/curl`）每 5s 从 redis_exporter metrics 获取 ROLE，PATCH pod label `redis-role=master|slave`
+1. `role-tagger` sidecar（`curlimages/curl`）每 5s 用 `curl telnet://127.0.0.1:6379` 发送 redis 协议（AUTH + INFO replication），直接从 redis 查询 ROLE，PATCH pod label `redis-role=master|slave`
 2. readinessProbe 改为 PING（所有 pod Ready，零失败事件）
 3. `<instance>-master.svc` selector 改为 `redis-role=master` → 只路由到 master
 4. RBAC: ServiceAccount + Role（patch pod label）+ RoleBinding
 **failover**: 新 master → sidecar 更新 label → Service 自动切流量（~5s）。
 **优势**: 消除事件风暴，slave 也 Ready（headless DNS 正常），无需 `publishNotReadyAddresses`。
+**关键**: role-tagger **不依赖 exporter 容器**——直接用 curl telnet 模式发 redis 协议查询角色，exporter 挂掉不影响标签更新（实测验证）。
+**坑**: curlimages/curl 镜像用 `command:` 覆盖 entrypoint 后，shell hash 缓存无 curl，需脚本开头 `hash -r`。
 
 ### 3. 不设 set -e
 

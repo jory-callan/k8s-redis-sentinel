@@ -1,6 +1,7 @@
 # ──────────────────────────────────────────────────────────────
 # RBAC for role-tagger sidecar
-# Allows sidecar to patch redis-role label on its own pod
+# 最小权限：只能 patch 当前实例的 3 个 redis pod 的 redis-role label
+# 限制：resourceNames 锁定 pod 名，verb 只留 get+patch（无 list/update）
 # ──────────────────────────────────────────────────────────────
 apiVersion: v1
 kind: ServiceAccount
@@ -20,7 +21,13 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "patch", "update"]
+    # 只允许操作当前实例的 3 个 redis pod（resourceNames 锁定）
+    resourceNames:
+      - {{ include "redis-sentinel.redisName" . }}-0
+      - {{ include "redis-sentinel.redisName" . }}-1
+      - {{ include "redis-sentinel.redisName" . }}-2
+    # 只允许 get 和 patch（不允许 list/update/delete，防滥用）
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

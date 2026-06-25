@@ -5,8 +5,31 @@
 **已验证的能力**（实测通过）：
 - 部署、复制、读写分离正常
 - 故障转移 ~15s 完成，Service 自动切流量
-- role-tagger 标签正确更新
+- role-tagger 标签正确更新（直接查 redis，不依赖 exporter）
+- exporter 挂掉不影响 role-tagger 工作（实测验证）
 - exporter 指标正常暴露
+
+**稳定性测试矩阵**（down-after=1s, failover-timeout=5s 极限参数实测）：
+
+| 场景 | 操作 | 结果 |
+|------|------|------|
+| 1 | 断开 1 个 redis (slave) | ✓ 自动恢复，读写正常 |
+| 2 | 断开 2 个 redis | ✓ 自动恢复，读写正常 |
+| 3 | 断开全部 3 个 redis | ✓ 全集群重启自愈，读写正常 |
+| 4 | 断开 1 个 sentinel | ✓ 集群稳定，读写正常 |
+| 5 | 断开 2 个 sentinel (剩 1) | ✓ 无 failover，保持原 master |
+| 6 | 断开全部 3 个 sentinel | ✓ 集群仍运行（仅无法 failover） |
+| 7 | 同时断开 1 redis + 1 sentinel | ✓ failover 成功，读写正常 |
+| 8 | 同时断开 2 redis + 2 sentinel | ✓ 自动恢复，读写正常 |
+| 9 | 同时断开全部 3 redis + 3 sentinel | ✓ 全集群重启自愈 |
+| 10 | RBAC 越权测试 | ✓ patch 其他 pod 被 403 拒绝 |
+
+**关键结论**：
+- 单点故障（1 个 pod 挂）：无感知，自动恢复
+- 多点故障（2 个挂）：failover 后恢复，~15s 不可写
+- 全集群故障（全挂）：重启后自动自愈，ordinal=0 自举 master
+- sentinel 全挂：不影响运行，只影响 failover 能力
+- RBAC 最小权限：只能 patch 当前实例的 3 个 redis pod，无法 list/update/操作其他 pod
 
 **但还不能直接投入生产**，存在以下不足：
 
@@ -18,7 +41,6 @@
 | 监控 | 只有 metrics 暴露，无 ServiceMonitor/PrometheusRule/告警 | 故障无感知 |
 | 密码 | values.yaml 明文密码 | 应用 externalSecret + KMS |
 | 网络 | 无 NetworkPolicy | 任意 pod 可访问 |
-| role-tagger | 依赖 exporter 存活，exporter 挂则标签不更新 | 路由卡在旧 master |
 | PVC | Helm uninstall 不删 PVC（K8s 默认） | 残留资源 |
 
 **建议**：上生产前至少补齐备份、监控告警、NetworkPolicy，并做多节点故障演练。
@@ -29,12 +51,14 @@
 
 ```
 while true; do
-  1. curl http://127.0.0.1:9121/metrics 获取 redis_instance_info
-  2. 从中提取 role="master" 或 role="slave"
+  1. curl telnet://127.0.0.1:6379 发送 AUTH + INFO replication (redis 协议)
+  2. 从响应中提取 role:master 或 role:slave
   3. 只有 role 变化时才 PATCH pod label（减少 API 压力）
   4. sleep 5s
 done
 ```
+
+**关键改进**：直接用 curl telnet 模式发 redis 协议查询角色，**不依赖 exporter 容器**。即使 exporter 挂了，role-tagger 仍能正常工作（已实测验证）。
 
 **不是"选举成功后立即切换"**，流程是：
 
@@ -52,4 +76,6 @@ Master Service endpoints 更新 → 流量切到新 master
 
 **为什么不用事件驱动**：Redis 5 没有角色变更的 webhook/通知机制，只能轮询。轮询间隔 5s 是性能与延迟的折中——更短增加 API 压力，更长 failover 后写入延迟。
 
-**潜在问题**：如果 exporter 容器挂了，role-tagger 拿不到 metrics，标签不会更新，Master Service 会卡在旧 master。livenessProbe 会在 60s 后重启 sidecar，但期间路由是错的。生产建议加 exporter 健康告警。
+**为什么用 curl telnet 而非 redis-cli**：`curlimages/curl` 镜像只有 ~4MB，且 curl 支持 telnet 协议发送原始 redis 命令。`redis:alpine` 镜像虽有 redis-cli 但 busybox wget 不支持 PATCH method，无法调用 K8s API。curlimages/curl 同时满足两个需求（查 redis + 调 K8s API）。
+
+**注意**：curlimages/curl 镜像的 curl 二进制在 `/usr/bin/curl`，但用 `command:` 覆盖 entrypoint 后 shell hash 缓存里没有 curl，需在脚本开头 `hash -r` 清除缓存。
