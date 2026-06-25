@@ -272,3 +272,13 @@ done
 2. **entrypoint.sh (sentinel)**: find_master 从其他 sentinel 拿到 master IP 后，**验证可达性**，不可达则继续扫描 redis pod
 **验证**: 同时删 3 redis + 2 sentinel → redis-0 自举 master → redis-1/2 成为 slave → sentinel 监控新 master → 集群恢复。所有 pod 3/3 Ready。
 **关键**: 这是"无论如何删除都能恢复"的关键修复。
+
+---
+
+## 坑 22: sentinel fallback 到 127.0.0.1 导致死锁
+
+**现象**: 全集群重启时, 若 redis-0 pod 还没创建 (节点资源紧张/镜像拉取慢), sentinel fallback 到 `127.0.0.1` (自己), 永远不会发现真正的 master.
+**根因**: entrypoint.sh 的 fallback 逻辑 `[ -z "${MASTER_IP}" ] && MASTER_IP="127.0.0.1"`. sentinel 监控 127.0.0.1:6379 (自己没有 redis), PING 失败但 sentinel 本身的 26379 端口 PING 成功, 所以 sentinel 不会 crash, 也不会重新 find_master.
+**影响**: 全集群重启时若 redis-0 创建慢, sentinel 死锁.
+**修复**: fallback 失败时 `exit 1` (crash 重启), 等 redis-0 创建后再启动.
+**验证**: 删 sentinel 后重启, find_master 失败时 exit 1, K8s 重启, redis-0 创建后 find_master 成功.

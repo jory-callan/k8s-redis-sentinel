@@ -68,7 +68,13 @@ data:
     if [ -z "${MASTER_IP}" ]; then
       echo "[cold] no master found, defaulting to redis-0"
       MASTER_IP="$(getent hosts "redis-0.redis-hl.${NAMESPACE}.svc" 2>/dev/null | awk '{print $1}')"
-      [ -z "${MASTER_IP}" ] && MASTER_IP="127.0.0.1"
+      if [ -z "${MASTER_IP}" ]; then
+        # redis-0 pod not yet created. Crash and let K8s restart us.
+        # Do NOT fallback to 127.0.0.1 — sentinel would monitor itself
+        # and never discover the real master (deadlock).
+        echo "[error] cannot resolve redis-0, exiting (will retry on restart)"
+        exit 1
+      fi
     fi
 
     echo "[sentinel] monitoring ${MASTER_IP}:6379"
