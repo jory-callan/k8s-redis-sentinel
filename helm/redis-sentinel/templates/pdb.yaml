@@ -1,0 +1,33 @@
+{{- if .Values.pdb.enabled }}
+# ──────────────────────────────────────────────────────────────
+# PodDisruptionBudgets — ensure quorum during voluntary disruptions
+# ──────────────────────────────────────────────────────────────
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "redis-sentinel.redisName" . }}-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app: {{ include "redis-sentinel.redisName" . }}
+spec:
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      app: {{ include "redis-sentinel.redisName" . }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "redis-sentinel.sentinelName" . }}-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app: {{ include "redis-sentinel.sentinelName" . }}
+spec:
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      app: {{ include "redis-sentinel.sentinelName" . }}
+{{- end }}

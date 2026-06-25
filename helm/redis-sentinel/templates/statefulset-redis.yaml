@@ -1,0 +1,234 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "redis-sentinel.redisName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app: {{ include "redis-sentinel.redisName" . }}
+spec:
+  serviceName: {{ include "redis-sentinel.redisHl" . }}
+  replicas: {{ .Values.redis.replicas }}
+  # Parallel: all pods start simultaneously
+  # Split-brain prevention is in startup.sh (ordinal>0 never self-promotes)
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: {{ include "redis-sentinel.redisName" . }}
+  template:
+    metadata:
+      labels:
+        {{- include "redis-sentinel.redisLabels" . | nindent 8 }}
+      annotations:
+        # Roll pods when configmap changes
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-redis.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "redis-sentinel.redisName" . }}-role-tagger
+      terminationGracePeriodSeconds: 30
+      {{- if .Values.common.podAntiAffinity }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: {{ include "redis-sentinel.redisName" . }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      containers:
+        # ── Redis ──────────────────────────────────────
+        - name: redis
+          image: {{ include "redis-sentinel.redisImage" . }}
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          command:
+            - sh
+            - /conf/startup.sh
+          ports:
+            - name: redis
+              containerPort: 6379
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: INSTANCE_NAME
+              value: {{ include "redis-sentinel.instanceName" . | quote }}
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            {{- if .Values.common.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis-sentinel.secretName" . }}
+                  key: redis-password
+                  optional: true
+            {{- end }}
+          # startupProbe: generous timeout for cold start
+          startupProbe:
+            exec:
+              command:
+                {{- include "redis-sentinel.pingProbe" . | nindent 16 }}
+            initialDelaySeconds: {{ .Values.redis.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.redis.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.redis.probes.startup.failureThreshold }}
+          # readinessProbe: PING (health check only).
+          # Master routing is handled by redis-role label (set by role-tagger sidecar)
+          # and <instance>-master.svc selector redis-role=master.
+          # This avoids storm of probe-failure events on slaves.
+          readinessProbe:
+            exec:
+              command:
+                {{- include "redis-sentinel.pingProbe" . | nindent 16 }}
+            initialDelaySeconds: {{ .Values.redis.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.redis.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.redis.probes.readiness.failureThreshold }}
+          livenessProbe:
+            exec:
+              command:
+                {{- include "redis-sentinel.pingProbe" . | nindent 16 }}
+            initialDelaySeconds: {{ .Values.redis.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.redis.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.redis.probes.liveness.failureThreshold }}
+          volumeMounts:
+            - name: conf
+              mountPath: /conf
+              readOnly: true
+            - name: data
+              mountPath: /data
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+
+        {{- if .Values.redis.exporter.enabled }}
+        # ── Redis Exporter (Prometheus sidecar) ──────────
+        - name: exporter
+          image: {{ include "redis-sentinel.redisExporterImage" . }}
+          imagePullPolicy: {{ .Values.redis.exporter.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: 9121
+          env:
+            - name: REDIS_ADDR
+              value: redis://127.0.0.1:6379
+            {{- if .Values.common.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis-sentinel.secretName" . }}
+                  key: redis-password
+                  optional: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.redis.exporter.resources | nindent 12 }}
+        {{- end }}
+
+        # ── role-tagger sidecar ───────────────────────────
+        # Polls redis_exporter metrics every {{ .Values.redis.roleTagger.intervalSeconds }}s for role,
+        # patches pod label redis-role=master|slave. <instance>-master.svc selector uses
+        # redis-role=master → routes only to master. Replaces readinessProbe=ROLE=master
+        # (which caused storm of failure events on slaves).
+        # Uses curlimages/curl (lightweight, ~4MB) — no kubectl/redis-cli needed.
+        - name: role-tagger
+          image: {{ include "redis-sentinel.roleTaggerImage" . }}
+          imagePullPolicy: {{ .Values.redis.roleTagger.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              set -u
+              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+              CACERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+              NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+              APISERVER="https://kubernetes.default.svc"
+              METRICS_URL="http://127.0.0.1:9121/metrics"
+              ALIVE_FILE="/tmp/last_alive"
+
+              echo "[role-tagger] starting, pod=$POD_NAME ns=$NS"
+
+              # Wait for exporter to be ready (avoid noise during startup)
+              i=0
+              while [ "$i" -lt 30 ]; do
+                if curl -s --max-time 2 "$METRICS_URL" >/dev/null 2>&1; then
+                  echo "[role-tagger] exporter ready"
+                  break
+                fi
+                i=$((i+1)); sleep 2
+              done
+
+              LAST_ROLE=""
+              while true; do
+                ROLE="$(curl -s --max-time 3 "$METRICS_URL" 2>/dev/null \
+                        | grep '^redis_instance_info' \
+                        | sed -n 's/.*role="\([a-z]*\)".*/\1/p' | head -1)"
+
+                if [ "$ROLE" = "master" ] || [ "$ROLE" = "slave" ]; then
+                  # Patch label only when role changed (reduce API calls)
+                  if [ "$ROLE" != "$LAST_ROLE" ]; then
+                    HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CACERT" -X PATCH \
+                      -H "Authorization: Bearer $TOKEN" \
+                      -H "Content-Type: application/merge-patch+json" \
+                      --data "{\"metadata\":{\"labels\":{\"redis-role\":\"$ROLE\"}}}" \
+                      "$APISERVER/api/v1/namespaces/$NS/pods/$POD_NAME")"
+                    if [ "$HTTP_CODE" = "200" ]; then
+                      echo "[role-tagger] role=$ROLE (label updated, http=$HTTP_CODE)"
+                      LAST_ROLE="$ROLE"
+                    else
+                      echo "[role-tagger] role=$ROLE but patch failed http=$HTTP_CODE"
+                    fi
+                  fi
+                  # heartbeat: touch alive file every cycle
+                  : > "$ALIVE_FILE"
+                else
+                  echo "[role-tagger] role unknown (empty?), skip"
+                fi
+                sleep {{ .Values.redis.roleTagger.intervalSeconds }}
+              done
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          # livenessProbe: if sidecar hasn't updated alive file in time, restart it
+          # (covers: curl hang, infinite loop without sleep, exporter down long)
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  [ -f /tmp/last_alive ] && find /tmp/last_alive -mmin -{{ div (add .Values.redis.roleTagger.livenessTimeoutSeconds 59) 60 }} | grep -q . || exit 1
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 2
+          resources:
+            {{- toYaml .Values.redis.roleTagger.resources | nindent 12 }}
+
+      volumes:
+        - name: conf
+          configMap:
+            name: {{ include "redis-sentinel.redisName" . }}-config
+            defaultMode: 0755
+        {{- if not .Values.redis.persistence.enabled }}
+        # ── emptyDir: non-persistent (data lost on pod restart) ──
+        - name: data
+          emptyDir: {}
+        {{- end }}
+
+  {{- if .Values.redis.persistence.enabled }}
+  # ── PVC: persistent storage (production) ──────────────
+  # Requires a default StorageClass in the cluster
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.redis.persistence.accessModes | nindent 10 }}
+        {{- if .Values.redis.persistence.storageClass }}
+        storageClassName: {{ .Values.redis.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.redis.persistence.size | quote }}
+  {{- end }}

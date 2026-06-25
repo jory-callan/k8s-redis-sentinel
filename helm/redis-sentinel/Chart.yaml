@@ -1,0 +1,15 @@
+apiVersion: v2
+name: redis-sentinel
+description: Redis-Sentinel 自动故障转移集群 (1主2从, 纯 K8s 原生, 零 Operator)
+type: application
+version: 1.0.0
+appVersion: "5.0.8"
+keywords:
+  - redis
+  - sentinel
+  - cluster
+  - failover
+home: https://github.com/redis/redis
+maintainers:
+  - name: redis-sentinel-k8s
+icon: ""

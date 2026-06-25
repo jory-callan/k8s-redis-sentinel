@@ -1,0 +1,126 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "redis-sentinel.sentinelName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app: {{ include "redis-sentinel.sentinelName" . }}
+spec:
+  serviceName: {{ include "redis-sentinel.sentinelHl" . }}
+  replicas: {{ .Values.sentinel.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: {{ include "redis-sentinel.sentinelName" . }}
+  template:
+    metadata:
+      labels:
+        {{- include "redis-sentinel.sentinelLabels" . | nindent 8 }}
+      annotations:
+        # Roll pods when configmap changes
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-sentinel.yaml") . | sha256sum }}
+    spec:
+      terminationGracePeriodSeconds: 30
+      {{- if .Values.common.podAntiAffinity }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: {{ include "redis-sentinel.sentinelName" . }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      containers:
+        # ── Redis Sentinel ─────────────────────────────
+        - name: sentinel
+          image: {{ include "redis-sentinel.sentinelImage" . }}
+          imagePullPolicy: {{ .Values.sentinel.image.pullPolicy }}
+          command:
+            - sh
+            - /conf/entrypoint.sh
+          ports:
+            - name: sentinel
+              containerPort: 26379
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: INSTANCE_NAME
+              value: {{ include "redis-sentinel.instanceName" . | quote }}
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            {{- if .Values.common.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis-sentinel.secretName" . }}
+                  key: redis-password
+                  optional: true
+            {{- end }}
+          # startupProbe: sentinel discovery can take up to 200s
+          startupProbe:
+            exec:
+              command:
+                {{- include "redis-sentinel.sentinelPingProbe" . | nindent 16 }}
+            initialDelaySeconds: {{ .Values.sentinel.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.sentinel.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.sentinel.probes.startup.failureThreshold }}
+          readinessProbe:
+            exec:
+              command:
+                {{- include "redis-sentinel.sentinelReadinessProbe" . | nindent 16 }}
+            initialDelaySeconds: {{ .Values.sentinel.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.sentinel.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.sentinel.probes.readiness.failureThreshold }}
+          livenessProbe:
+            exec:
+              command:
+                {{- include "redis-sentinel.sentinelPingProbe" . | nindent 16 }}
+            initialDelaySeconds: {{ .Values.sentinel.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.sentinel.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.sentinel.probes.liveness.failureThreshold }}
+          volumeMounts:
+            - name: conf
+              mountPath: /conf
+              readOnly: true
+            - name: data
+              mountPath: /data
+          resources:
+            {{- toYaml .Values.sentinel.resources | nindent 12 }}
+
+        {{- if .Values.sentinel.exporter.enabled }}
+        # ── Sentinel Exporter (Prometheus sidecar) ──────
+        - name: exporter
+          image: {{ include "redis-sentinel.sentinelExporterImage" . }}
+          imagePullPolicy: {{ .Values.sentinel.exporter.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: 9121
+          env:
+            - name: REDIS_ADDR
+              value: redis://127.0.0.1:26379
+            {{- if .Values.common.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis-sentinel.secretName" . }}
+                  key: redis-password
+                  optional: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.sentinel.exporter.resources | nindent 12 }}
+        {{- end }}
+
+      volumes:
+        - name: conf
+          configMap:
+            name: {{ include "redis-sentinel.sentinelName" . }}-config
+            defaultMode: 0755
+        - name: data
+          emptyDir: {}

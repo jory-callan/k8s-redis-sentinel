@@ -1,0 +1,56 @@
+═══════════════════════════════════════════════════════════════
+  Redis-Sentinel deployed: {{ include "redis-sentinel.instanceName" . }}
+  Namespace: {{ .Release.Namespace }}
+═══════════════════════════════════════════════════════════════
+
+1. Wait for pods to be ready:
+
+  kubectl -n {{ .Release.Namespace }} wait pod --for=condition=Ready \
+    -l "app in ({{ include "redis-sentinel.redisName" . }},{{ include "redis-sentinel.sentinelName" . }})" --timeout=300s
+
+2. Connection info:
+
+  {{- $inst := include "redis-sentinel.instanceName" . }}
+  {{- $ns := .Release.Namespace }}
+  Write (Master):  {{ $inst }}-master.{{ $ns }}.svc:6379
+  Read  (All):    {{ $inst }}-read.{{ $ns }}.svc:6379
+  Sentinel:       {{ $inst }}-sentinel-0.{{ $inst }}-sentinel-hl.{{ $ns }}.svc:26379
+
+  {{- if .Values.redis.exporter.enabled }}
+  Redis Metrics:   {{ $inst }}-exporter.{{ $ns }}.svc:9121
+  {{- end }}
+  {{- if .Values.sentinel.exporter.enabled }}
+  Sentinel Metrics: {{ $inst }}-sentinel-exporter.{{ $ns }}.svc:9121
+  {{- end }}
+
+3. Get password:
+
+  {{- if .Values.common.auth.enabled }}
+  {{- if .Values.common.auth.existingSecret }}
+  kubectl -n {{ $ns }} get secret {{ .Values.common.auth.existingSecret }} -o jsonpath='{.data.redis-password}' | base64 -d
+  {{- else }}
+  kubectl -n {{ $ns }} get secret {{ include "redis-sentinel.secretName" . }} -o jsonpath='{.data.redis-password}' | base64 -d
+  {{- end }}
+
+  Connect with password:
+  kubectl -n {{ $ns }} exec {{ $inst }}-0 -- redis-cli -a '<PASSWORD>' ping
+  {{- else }}
+  No password (auth disabled).
+  kubectl -n {{ $ns }} exec {{ $inst }}-0 -- redis-cli ping
+  {{- end }}
+
+4. Verify cluster state:
+
+  kubectl -n {{ $ns }} get pods -l "app in ({{ $inst }},{{ $inst }}-sentinel)" -o wide
+  kubectl -n {{ $ns }} exec {{ $inst }}-sentinel-0 -- redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+
+5. {{- if eq .Values.service.type "NodePort" }} NodePort access:{{ else }} Expose externally (optional):{{ end }}
+
+  {{- if eq .Values.service.type "NodePort" }}
+  NodePort is enabled:
+    Master: <node-ip>:{{ .Values.service.nodePort.master | default "<auto>" }}
+    Read:   <node-ip>:{{ .Values.service.nodePort.read | default "<auto>" }}
+  {{- else }}
+  Set service.type=NodePort or create your own Service with selector:
+    app={{ $inst }}, redis-role=master
+  {{- end }}

@@ -1,0 +1,184 @@
+# ═══════════════════════════════════════════════════════════════
+# Redis-Sentinel Helm Chart — Values
+#
+# 结构: common (共享) + redis (Redis pod) + sentinel (Sentinel pod)
+# 每个 pod 下含: image / replicas / resources / exporter / config / probes
+#
+# Usage:
+#   helm install my-redis ./helm/redis-sentinel -n redis --create-namespace
+#   helm install log ./helm/redis-sentinel -n middleware \
+#     --set common.instanceName=redis-saas-log \
+#     --set common.auth.password=mypassword
+# ═══════════════════════════════════════════════════════════════
+
+# ── 共享配置 ────────────────────────────────────────────────────
+common:
+  # 实例名称 (业务强关联, 用于资源前缀隔离)
+  # 默认使用 release name; K8s 资源名最长 63 字符, Pod 名 = instance + "-sentinel-0" (12 字符)
+  # 故 instanceName 最长 42 字符
+  instanceName: ""
+
+  # 认证 (Redis + Sentinel 共用)
+  auth:
+    enabled: true
+    # 直接指定密码 (生产环境建议用 existingSecret)
+    password: "redis123"
+    # 使用已存在的 Secret (优先于 password), 需包含 key: redis-password
+    existingSecret: ""
+
+  # Pod 反亲和: 让 pod 尽量分散到不同节点 (preferred, 不强制)
+  podAntiAffinity: true
+
+# ── Redis Pod 配置 ─────────────────────────────────────────────
+redis:
+  image:
+    repository: redis
+    tag: "5.0.8"
+    pullPolicy: IfNotPresent
+
+  # 副本数 (建议奇数, 1主2从最小可用)
+  replicas: 3
+
+  # 资源限制
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    # limits:
+    #   cpu: 500m
+    #   memory: 512Mi
+
+  # 持久化存储
+  persistence:
+    enabled: true
+    # 存储类 (留空使用集群默认 StorageClass)
+    storageClass: ""
+    size: 1Gi
+    accessModes:
+      - ReadWriteOnce
+
+  # Prometheus exporter sidecar
+  exporter:
+    enabled: true
+    image:
+      repository: oliver006/redis_exporter
+      tag: "v1.57.0"
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 25m
+        memory: 16Mi
+
+  # role-tagger sidecar (PATCH pod label redis-role=master|slave)
+  roleTagger:
+    image:
+      repository: curlimages/curl
+      tag: "7.88.1"
+      pullPolicy: IfNotPresent
+    # 轮询间隔 (s)
+    intervalSeconds: 5
+    # liveness: 超过此时间未更新 alive 文件则重启 sidecar (s)
+    livenessTimeoutSeconds: 60
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+
+  # 额外 redis.conf 配置 (每项 = 一行, 直接追加到 redis.conf)
+  # 注: port/dir/daemonize/protected-mode/slave-announce-ip/requirepass 由模板自动生成
+  config:
+    - "save 900 1"
+    - "save 300 10"
+    - "save 60 10000"
+    - "min-slaves-to-write 1"
+    - "min-slaves-max-lag 10"
+    - "slave-serve-stale-data yes"
+    - "slave-read-only yes"
+    - "slave-priority 100"
+    - "timeout 0"
+    - "tcp-keepalive 300"
+    - "tcp-backlog 511"
+
+  # 健康检查
+  probes:
+    startup:
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      failureThreshold: 30
+    readiness:
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      failureThreshold: 3
+    liveness:
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      failureThreshold: 3
+
+# ── Sentinel Pod 配置 ──────────────────────────────────────────
+sentinel:
+  image:
+    repository: redis
+    tag: "5.0.8"
+    pullPolicy: IfNotPresent
+
+  # 副本数 (建议奇数, quorum = ceil(replicas/2)+1)
+  replicas: 3
+
+  # quorum: 多少哨兵同意才触发 failover
+  quorum: 2
+
+  # 资源限制
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+
+  # Prometheus exporter sidecar
+  exporter:
+    enabled: true
+    image:
+      repository: oliver006/redis_exporter
+      tag: "v1.57.0"
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+
+  # 额外 sentinel.conf 配置 (每项 = 一行, 追加到 monitor 行之后)
+  # 注: port/dir/daemonize/protected-mode/monitor/announce-ip/requirepass 由模板自动生成
+  config:
+    - "sentinel down-after-milliseconds mymaster 5000"
+    - "sentinel failover-timeout mymaster 10000"
+    - "sentinel parallel-syncs mymaster 1"
+
+  # 健康检查
+  probes:
+    startup:
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      failureThreshold: 40
+    readiness:
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      failureThreshold: 3
+    liveness:
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      failureThreshold: 3
+
+# ── Service 配置 ──────────────────────────────────────────────
+service:
+  # Master / Read Service 类型 (默认 ClusterIP)
+  # 可选: ClusterIP | NodePort | LoadBalancer
+  type: ClusterIP
+  # NodePort 配置 (type=NodePort 时生效, 需自行选择未占用端口)
+  nodePort:
+    master: ""    # 例: 30001
+    read: ""      # 例: 30002
+  # annotations: {}
+
+# ── PodDisruptionBudget ───────────────────────────────────────
+pdb:
+  enabled: true
+  minAvailable: 2

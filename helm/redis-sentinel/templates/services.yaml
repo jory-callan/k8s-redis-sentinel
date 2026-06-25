@@ -1,0 +1,136 @@
+# ──────────────────────────────────────────────────────────────
+# All Services for Redis-Sentinel cluster
+#
+# Naming convention (instance = {{ include "redis-sentinel.instanceName" . }}):
+#   <instance>-hl                Headless (redis pods)
+#   <instance>-master            ClusterIP/NodePort (write, routes to master only)
+#   <instance>-read              ClusterIP/NodePort (read, routes to all pods)
+#   <instance>-exporter          ClusterIP (redis metrics, if enabled)
+#   <instance>-sentinel-hl       Headless (sentinel pods)
+#   <instance>-sentinel-exporter ClusterIP (sentinel metrics, if enabled)
+# ──────────────────────────────────────────────────────────────
+
+# <instance>-hl: Headless, stable per-pod DNS (<instance>-0.<instance>-hl, ...)
+# publishNotReadyAddresses=true so slaves (NotReady) are also resolvable
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis-sentinel.redisHl" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app: {{ include "redis-sentinel.redisName" . }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: {{ include "redis-sentinel.redisName" . }}
+  ports:
+    - name: redis
+      port: 6379
+
+# <instance>-master: routes ONLY to master
+# (sidecar role-tagger sets redis-role=master on master pod → Service routes to it)
+# This replaces readinessProbe=ROLE=master to avoid storm of probe-failure events.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis-sentinel.redisName" . }}-master
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app: {{ include "redis-sentinel.redisName" . }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: {{ include "redis-sentinel.redisName" . }}
+    redis-role: master
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort.master }}
+      nodePort: {{ .Values.service.nodePort.master }}
+      {{- end }}
+
+# <instance>-read: routes to ALL pods (master + slaves)
+# publishNotReadyAddresses=true so slaves receive read traffic too
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis-sentinel.redisName" . }}-read
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app: {{ include "redis-sentinel.redisName" . }}
+spec:
+  type: {{ .Values.service.type }}
+  publishNotReadyAddresses: true
+  selector:
+    app: {{ include "redis-sentinel.redisName" . }}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort.read }}
+      nodePort: {{ .Values.service.nodePort.read }}
+      {{- end }}
+
+# <instance>-sentinel-hl: Headless, stable per-pod DNS
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis-sentinel.sentinelHl" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app: {{ include "redis-sentinel.sentinelName" . }}
+spec:
+  clusterIP: None
+  selector:
+    app: {{ include "redis-sentinel.sentinelName" . }}
+  ports:
+    - name: sentinel
+      port: 26379
+
+{{- if .Values.redis.exporter.enabled }}
+# <instance>-exporter: Prometheus metrics for Redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis-sentinel.redisName" . }}-exporter
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app: {{ include "redis-sentinel.redisName" . }}
+spec:
+  selector:
+    app: {{ include "redis-sentinel.redisName" . }}
+  ports:
+    - name: metrics
+      port: 9121
+{{- end }}
+
+{{- if .Values.sentinel.exporter.enabled }}
+# <instance>-sentinel-exporter: Prometheus metrics for Sentinel
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis-sentinel.sentinelName" . }}-exporter
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app: {{ include "redis-sentinel.sentinelName" . }}
+spec:
+  selector:
+    app: {{ include "redis-sentinel.sentinelName" . }}
+  ports:
+    - name: metrics
+      port: 9121
+{{- end }}

@@ -1,0 +1,39 @@
+# ──────────────────────────────────────────────────────────────
+# RBAC for role-tagger sidecar
+# Allows sidecar to patch redis-role label on its own pod
+# ──────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "redis-sentinel.redisName" . }}-role-tagger
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "redis-sentinel.redisName" . }}-role-tagger
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "redis-sentinel.redisName" . }}-role-tagger
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "redis-sentinel.redisName" . }}-role-tagger
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "redis-sentinel.redisName" . }}-role-tagger
+  apiGroup: rbac.authorization.k8s.io
