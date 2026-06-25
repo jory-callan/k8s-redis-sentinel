@@ -1,0 +1,154 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "redis-sentinel.instanceName" . }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-sentinel.labels" . | nindent 4 }}
+    app: {{ include "redis-sentinel.redisName" . }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: {{ .Values.backup.concurrencyPolicy | default "Forbid" }}
+  successfulJobsHistoryLimit: {{ .Values.backup.historyLimit | default 3 }}
+  failedJobsHistoryLimit: {{ .Values.backup.historyLimit | default 3 }}
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          # 备份只通过 Service 网络访问 redis + 对象存储, 不调用 K8s API
+          # 用默认 SA 即可, 不依赖 role-tagger (解耦)
+          {{- with .Values.common.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          initContainers:
+            # 阶段1: 从 master 拉取 RDB 快照
+            # --rdb 通过复制协议拉取, 触发 master fork 一次 (备份固有代价)
+            # 不挂 PVC, 避免 RWO 与 redis pod 冲突
+            - name: rdb-dumper
+              image: "{{ .Values.backup.dumperImage.repository }}:{{ .Values.backup.dumperImage.tag }}"
+              imagePullPolicy: {{ .Values.backup.dumperImage.pullPolicy }}
+              env:
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "redis-sentinel.secretName" . }}
+                      key: redis-password
+                      optional: true
+                - name: INSTANCE_NAME
+                  value: {{ include "redis-sentinel.instanceName" . }}
+                - name: NAMESPACE
+                  value: {{ .Release.Namespace }}
+              volumeMounts:
+                - name: rdb
+                  mountPath: /rdb
+              command:
+                - sh
+                - -c
+                - |
+                  set -u
+                  # master service 自动路由到当前 master (role-tagger 维护 label)
+                  MASTER_HOST="${INSTANCE_NAME}-master.${NAMESPACE}.svc.cluster.local"
+                  echo "[dump] connecting master ${MASTER_HOST}:6379"
+                  # AUTH 探活, 确认 master 可达
+                  AUTH_ARGS=""
+                  [ -n "${REDIS_PASSWORD:-}" ] && AUTH_ARGS="-a ${REDIS_PASSWORD}"
+                  if ! redis-cli -h "${MASTER_HOST}" ${AUTH_ARGS} PING 2>/dev/null | grep -q PONG; then
+                    echo "[error] master ${MASTER_HOST} unreachable"
+                    exit 1
+                  fi
+                  # --rdb 拉取 RDB (会阻塞直到传输完成)
+                  # timeout 防止大数据集时 hang (最长 10 分钟)
+                  echo "[dump] pulling RDB..."
+                  if ! timeout 600 redis-cli -h "${MASTER_HOST}" ${AUTH_ARGS} --rdb /rdb/dump.rdb 2>/dev/null; then
+                    echo "[error] --rdb failed or timed out"
+                    exit 1
+                  fi
+                  SIZE=$(wc -c < /rdb/dump.rdb 2>/dev/null || echo 0)
+                  echo "[dump] rdb size=${SIZE} bytes"
+                  if [ "${SIZE}" -lt 10 ]; then
+                    echo "[error] rdb too small, aborting"
+                    exit 1
+                  fi
+                  # 压缩节省带宽与存储
+                  gzip -f /rdb/dump.rdb
+                  GZ_SIZE=$(wc -c < /rdb/dump.rdb.gz)
+                  echo "[dump] gzipped=${GZ_SIZE} bytes"
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+          containers:
+            # 阶段2: 上传 MinIO + 清理旧备份
+            - name: uploader
+              image: "{{ .Values.backup.image.repository }}:{{ .Values.backup.image.tag }}"
+              imagePullPolicy: {{ .Values.backup.image.pullPolicy }}
+              env:
+                - name: MC_ENDPOINT
+                  value: {{ .Values.backup.endpoint | quote }}
+                - name: MC_BUCKET
+                  value: {{ .Values.backup.bucket | quote }}
+                - name: MC_REGION
+                  value: {{ .Values.backup.region | quote }}
+                - name: MC_INSECURE
+                  value: {{ .Values.backup.insecure | quote }}
+                - name: MC_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "redis-sentinel.backupSecretName" . }}
+                      key: access-key
+                - name: MC_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "redis-sentinel.backupSecretName" . }}
+                      key: secret-key
+                - name: INSTANCE_NAME
+                  value: {{ include "redis-sentinel.instanceName" . }}
+                - name: PREFIX
+                  value: {{ (.Values.backup.prefix | default (include "redis-sentinel.instanceName" .)) | quote }}
+                - name: RETENTION_DAYS
+                  value: {{ .Values.backup.retentionDays | quote }}
+              volumeMounts:
+                - name: rdb
+                  mountPath: /rdb
+                  readOnly: true
+              command:
+                - sh
+                - -c
+                - |
+                  set -u
+                  # mc alias 配置
+                  ALIAS_ARGS=""
+                  [ "${MC_INSECURE}" = "true" ] && ALIAS_ARGS="--insecure"
+                  mc alias set src "${MC_ENDPOINT}" "${MC_ACCESS_KEY}" "${MC_SECRET_KEY}" ${ALIAS_ARGS} 2>&1 || { echo "[error] mc alias set failed"; exit 1; }
+                  # region 仅 S3 需要, MinIO 可省略, 但设置无害
+                  export MC_REGION="${MC_REGION}"
+
+                  # 确保 prefix 路径存在 (mc cp 不会自动建目录, bucket 必须存在)
+                  # bucket 应由外部预创建; 这里只检查
+                  if ! mc ls "src/${MC_BUCKET}" >/dev/null 2>&1; then
+                    echo "[error] bucket ${MC_BUCKET} not found, please create it first"
+                    exit 1
+                  fi
+
+                  TS=$(date -u +%Y%m%d-%H%M%S)
+                  OBJECT="${MC_BUCKET}/${PREFIX}/${INSTANCE_NAME}-dump-${TS}.rdb.gz"
+                  echo "[upload] -> ${OBJECT}"
+                  mc cp ${ALIAS_ARGS} /rdb/dump.rdb.gz "src/${OBJECT}" 2>&1 || { echo "[error] upload failed"; exit 1; }
+                  # 验证上传成功 (mc 镜像精简, 无 awk/grep, 用 stat 退出码判断)
+                  mc stat ${ALIAS_ARGS} "src/${OBJECT}" >/dev/null 2>&1 && echo "[upload] ok, object=${OBJECT}" || { echo "[error] upload verify failed"; exit 1; }
+
+                  # 保留策略: 删除超过 N 天的备份
+                  echo "[retention] removing backups older than ${RETENTION_DAYS}d under ${MC_BUCKET}/${PREFIX}/"
+                  mc find ${ALIAS_ARGS} "src/${MC_BUCKET}/${PREFIX}/" --older-than "${RETENTION_DAYS}d" --exec "mc rm {}" 2>&1 || true
+
+                  # 列出当前备份清单
+                  echo "[retention] current backups:"
+                  mc ls ${ALIAS_ARGS} "src/${MC_BUCKET}/${PREFIX}/" 2>&1 | tail -10
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+          volumes:
+            - name: rdb
+              emptyDir: {}
+{{- end }}

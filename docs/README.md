@@ -14,6 +14,7 @@
 ## 运维
 
 - [monitoring.md](monitoring.md) — Prometheus 监控配置与告警规则
+- [backup.md](backup.md) — 备份与恢复（CronJob → MinIO/S3）
 - [production.md](production.md) — 生产就绪评估与已知不足
 
 ## 历史与经验

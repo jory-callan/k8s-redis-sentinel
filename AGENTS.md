@@ -135,6 +135,8 @@
 | `templates/rbac.yaml` | role-tagger RBAC（resourceNames 限当前实例 3 pod，仅 get/patch） |
 | `templates/networkpolicy.yaml` | NetworkPolicy（可选，限同实例+业务 pod+Prometheus 入站） |
 | `templates/servicemonitor.yaml` | ServiceMonitor + PrometheusRule（可选，11 条告警） |
+| `templates/backup-secret.yaml` | 备份 MinIO 凭证 Secret（可选，`backup.enabled` 且未用 `existingSecret`） |
+| `templates/backup-cronjob.yaml` | 备份 CronJob（可选，`redis-cli --rdb` → gzip → `mc cp` → 保留清理） |
 | `templates/NOTES.txt` | 部署后提示 |
 
 ### 文档（`docs/`）
@@ -146,6 +148,7 @@
 | `multi-instance.md` | 多实例隔离与命名规范 |
 | `helm.md` | Helm Chart 使用与配置 |
 | `monitoring.md` | Prometheus 监控配置 |
+| `backup.md` | 备份与恢复（CronJob → MinIO/S3） |
 | `production.md` | 生产就绪评估 |
 | `production-drills.md` | 生产故障演练清单（节点 drain/网络分区/多数派丢失等） |
 | `attempts.md` | 设计演进与尝试路径 |
