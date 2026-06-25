@@ -125,11 +125,12 @@ spec:
         {{- end }}
 
         # ── role-tagger sidecar ───────────────────────────
-        # Polls redis_exporter metrics every {{ .Values.redis.roleTagger.intervalSeconds }}s for role,
+        # Polls redis every {{ .Values.redis.roleTagger.intervalSeconds }}s for role (via redis-cli INFO replication),
         # patches pod label redis-role=master|slave. <instance>-master.svc selector uses
         # redis-role=master → routes only to master. Replaces readinessProbe=ROLE=master
         # (which caused storm of failure events on slaves).
-        # Uses curlimages/curl (lightweight, ~4MB) — no kubectl/redis-cli needed.
+        # Uses redis:alpine (contains redis-cli, ~30MB) — does NOT depend on exporter container.
+        # K8s API PATCH via wget (alpine built-in).
         - name: role-tagger
           image: {{ include "redis-sentinel.roleTaggerImage" . }}
           imagePullPolicy: {{ .Values.redis.roleTagger.image.pullPolicy }}
@@ -142,16 +143,21 @@ spec:
               CACERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
               NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
               APISERVER="https://kubernetes.default.svc"
-              METRICS_URL="http://127.0.0.1:9121/metrics"
               ALIVE_FILE="/tmp/last_alive"
 
               echo "[role-tagger] starting, pod=$POD_NAME ns=$NS"
 
-              # Wait for exporter to be ready (avoid noise during startup)
+              # Build redis-cli auth args (password optional)
+              CLI_ARGS="-h 127.0.0.1 -p 6379"
+              if [ -n "${REDIS_PASSWORD:-}" ]; then
+                CLI_ARGS="$CLI_ARGS -a $REDIS_PASSWORD"
+              fi
+
+              # Wait for redis to respond to PING (avoid noise during startup)
               i=0
               while [ "$i" -lt 30 ]; do
-                if curl -s --max-time 2 "$METRICS_URL" >/dev/null 2>&1; then
-                  echo "[role-tagger] exporter ready"
+                if redis-cli $CLI_ARGS PING 2>/dev/null | grep -q PONG; then
+                  echo "[role-tagger] redis ready"
                   break
                 fi
                 i=$((i+1)); sleep 2
@@ -159,18 +165,22 @@ spec:
 
               LAST_ROLE=""
               while true; do
-                ROLE="$(curl -s --max-time 3 "$METRICS_URL" 2>/dev/null \
-                        | grep '^redis_instance_info' \
-                        | sed -n 's/.*role="\([a-z]*\)".*/\1/p' | head -1)"
+                # Query role directly from redis (NOT from exporter metrics)
+                # INFO replication returns "role:master" or "role:slave"
+                ROLE="$(redis-cli $CLI_ARGS INFO replication 2>/dev/null \
+                        | grep '^role:' | cut -d: -f2 | tr -d '[:space:]')"
 
                 if [ "$ROLE" = "master" ] || [ "$ROLE" = "slave" ]; then
                   # Patch label only when role changed (reduce API calls)
                   if [ "$ROLE" != "$LAST_ROLE" ]; then
-                    HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CACERT" -X PATCH \
-                      -H "Authorization: Bearer $TOKEN" \
-                      -H "Content-Type: application/merge-patch+json" \
-                      --data "{\"metadata\":{\"labels\":{\"redis-role\":\"$ROLE\"}}}" \
-                      "$APISERVER/api/v1/namespaces/$NS/pods/$POD_NAME")"
+                    # PATCH via wget (alpine built-in, no curl needed)
+                    HTTP_CODE="$(wget -q -O /dev/null --server-response \
+                      --header="Authorization: Bearer $TOKEN" \
+                      --header="Content-Type: application/merge-patch+json" \
+                      --post-data="{\"metadata\":{\"labels\":{\"redis-role\":\"$ROLE\"}}}" \
+                      --ca-certificate="$CACERT" \
+                      "$APISERVER/api/v1/namespaces/$NS/pods/$POD_NAME" 2>&1 \
+                      | grep 'HTTP/' | tail -1 | awk '{print $2}')"
                     if [ "$HTTP_CODE" = "200" ]; then
                       echo "[role-tagger] role=$ROLE (label updated, http=$HTTP_CODE)"
                       LAST_ROLE="$ROLE"
@@ -190,8 +200,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            {{- if .Values.common.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis-sentinel.secretName" . }}
+                  key: redis-password
+                  optional: true
+            {{- end }}
           # livenessProbe: if sidecar hasn't updated alive file in time, restart it
-          # (covers: curl hang, infinite loop without sleep, exporter down long)
+          # (covers: redis-cli hang, infinite loop without sleep, redis down long)
           livenessProbe:
             exec:
               command:
