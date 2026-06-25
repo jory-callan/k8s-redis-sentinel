@@ -39,14 +39,14 @@
 | 网络隔离 | ✅ 已完成 | Chart 内置 `NetworkPolicy` 模板，`networkPolicy.enabled=true` 即启用，仅放行同实例 pod + 配置的业务 pod + Prometheus 抓取 |
 | 内存上限 | ✅ 已完成 | `redis.maxmemory` + `redis.maxmemoryPolicy` 可配置，防 OOM；`check.sh` 显示使用率并 >80% 告警 |
 | 密码 | ✅ 保留现状 | `password` 明文 / `existingSecret` 两种方式均可用（按需选择） |
-| 备份 | ✅ 已完成 | Chart 内置备份 CronJob（`backup.enabled=true`），`redis-cli --rdb` 拉取 → gzip → 上传 MinIO/S3，含保留策略与恢复流程；实测备份/恢复链路通过，详见 [backup.md](backup.md) |
+| 备份 | ✅ 已完成 | Chart 内置备份 CronJob（`backup.enabled=true`），`redis-cli --rdb` 拉取 → gzip → rclone 上传对象存储（S3/MinIO/阿里云 OSS/腾讯云 COS/AWS S3 等 40+ 后端，不绑定特定厂商），含保留策略与恢复流程；实测备份/恢复链路通过，详见 [backup.md](backup.md) |
 | 版本 | ⚠️ 评估 | Redis 5.0.8（项目非目标锁定 5.0.x，需评估可接受 CVE） |
 | 演练覆盖 | ⚠️ 待补 | k3s 多节点已测，生产节点 drain/网络分区演练见 [production-drills.md](production-drills.md) |
 | PVC | ⚠️ 保留 | K8s 默认 `helm uninstall` 不删 PVC（防误删）；`install.sh uninstall --purge` 可彻底清理 |
 
 **建议**：补齐备份后即可承接生产负载；上核心业务前按 [production-drills.md](production-drills.md) 做节点级故障演练。
 
-备份已就绪，建议同时：备份凭证改用 `existingSecret`（[backup.md](backup.md)），并在 [production-drills.md](production-drills.md) 的演练中加入"从 MinIO 恢复"一项。
+备份已就绪，建议同时：备份凭证改用 `existingSecret`（[backup.md](backup.md)），并在 [production-drills.md](production-drills.md) 的演练中加入"从对象存储恢复"一项。
 
 ## 生产推荐配置
 
@@ -63,6 +63,7 @@ helm install my-app ./helm/redis-sentinel -n redis \
   --set monitoring.alerts.enabled=true \
   --set backup.enabled=true \
   --set backup.endpoint=http://minio.minio.svc.cluster.local:80 \
+  --set backup.provider=Minio \
   --set backup.bucket=redis-test \
   --set backup.existingSecret=my-app-backup-secret \
   --set backup.retentionDays=7

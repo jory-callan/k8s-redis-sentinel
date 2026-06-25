@@ -221,15 +221,17 @@ monitoring:
     # 告警发送到的 namespace (PrometheusRule 资源所在 ns)
     namespace: ""
 
-# ── 备份 (CronJob → MinIO/S3) ────────────────────────────────
+# ── 备份 (CronJob → 对象存储) ─────────────────────────────────
 # 定时从 master 拉取 RDB 快照上传到对象存储
 # 原理: redis-cli --rdb 通过复制协议拉 RDB (触发 master fork, 不挂 PVC)
+# 上传工具: rclone (支持 S3/MinIO/阿里云OSS/腾讯云COS/Azure/GCS 等 40+ 后端,
+#           不绑定特定厂商, 配置改 endpoint+provider 即可切换)
 backup:
   enabled: false
-  # MinIO/S3 上传镜像 (需含 mc)
+  # 上传镜像 (rclone, 覆盖 40+ 对象存储后端)
   image:
-    repository: minio/mc
-    tag: "RELEASE.2024-01-11T05-49-32Z"
+    repository: rclone/rclone
+    tag: "1.66.0"
     pullPolicy: IfNotPresent
   # RDB 拉取镜像 (需含 redis-cli)
   dumperImage:
@@ -242,9 +244,14 @@ backup:
   concurrencyPolicy: Forbid
   # 保留历史 Job 数
   historyLimit: 3
-  # MinIO/S3 配置
+  # 对象存储配置 (rclone S3 backend)
+  # endpoint: 集群内 MinIO / 云厂商 S3 兼容端点
   endpoint: "http://minio.minio.svc.cluster.local:80"
-  # 外部 https 端点用自签名证书时设 true (集群内 http 无需)
+  # provider: rclone S3 backend 类型, 决定厂商特定行为
+  #   Minio / AWS / Alibaba / Tencent / Ceph / Other (空=自动)
+  # 切换存储只改 endpoint+provider, 不改脚本
+  provider: "Minio"
+  # 外部 https 端点用自签名证书时设 true (跳过证书校验, 集群内 http 无需)
   insecure: false
   bucket: "redis-test"
   # 备份在 bucket 下的子路径前缀 (默认用 instanceName 自动隔离多实例)

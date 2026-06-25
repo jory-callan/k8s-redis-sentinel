@@ -16,6 +16,12 @@ spec:
     spec:
       backoffLimit: 2
       template:
+        metadata:
+          labels:
+            {{- include "redis-sentinel.labels" . | nindent 12 }}
+            # app=<instance> 让 NetworkPolicy 放行 backup pod 访问 master:6379
+            # (NetworkPolicy ingress 6379 规则放行 app=<instance> 的 pod)
+            app: {{ include "redis-sentinel.redisName" . }}
         spec:
           restartPolicy: OnFailure
           # 备份只通过 Service 网络访问 redis + 对象存储, 不调用 K8s API
@@ -80,31 +86,46 @@ spec:
               resources:
                 {{- toYaml .Values.backup.resources | nindent 16 }}
           containers:
-            # 阶段2: 上传 MinIO + 清理旧备份
+            # 阶段2: 上传对象存储 + 清理旧备份
+            # 使用 rclone (覆盖 S3/MinIO/阿里云OSS/腾讯云COS/Azure/GCS 等 40+ 后端,
+            # 不绑定特定厂商, 通过环境变量配置, 切换存储只改 endpoint+provider)
             - name: uploader
               image: "{{ .Values.backup.image.repository }}:{{ .Values.backup.image.tag }}"
               imagePullPolicy: {{ .Values.backup.image.pullPolicy }}
+              # rclone 配置全部走环境变量 (无需 rclone.conf 文件)
+              # 命名规范: RCLONE_CONFIG_<REMOTE>_<KEY>
+              # 此处 remote 名为 dst, 即访问 dst:bucket/path
               env:
-                - name: MC_ENDPOINT
+                - name: RCLONE_CONFIG_DST_TYPE
+                  value: s3
+                - name: RCLONE_CONFIG_DST_PROVIDER
+                  value: {{ .Values.backup.provider | quote }}
+                - name: RCLONE_CONFIG_DST_ENDPOINT
                   value: {{ .Values.backup.endpoint | quote }}
-                - name: MC_BUCKET
-                  value: {{ .Values.backup.bucket | quote }}
-                - name: MC_REGION
+                - name: RCLONE_CONFIG_DST_REGION
                   value: {{ .Values.backup.region | quote }}
-                - name: MC_INSECURE
-                  value: {{ .Values.backup.insecure | quote }}
-                - name: MC_ACCESS_KEY
+                - name: RCLONE_CONFIG_DST_ACCESS_KEY_ID
                   valueFrom:
                     secretKeyRef:
                       name: {{ include "redis-sentinel.backupSecretName" . }}
                       key: access-key
-                - name: MC_SECRET_KEY
+                - name: RCLONE_CONFIG_DST_SECRET_ACCESS_KEY
                   valueFrom:
                     secretKeyRef:
                       name: {{ include "redis-sentinel.backupSecretName" . }}
                       key: secret-key
+                {{- if .Values.backup.insecure }}
+                # 跳过 TLS 证书校验 (自签名 https 端点)
+                - name: RCLONE_CONFIG_DST_NO_CHECK_CERTIFICATE
+                  value: "true"
+                {{- end }}
+                # rclone 运行参数: 静默无交互, 失败快退出
+                - name: RCLONE_STATS
+                  value: "0"
                 - name: INSTANCE_NAME
                   value: {{ include "redis-sentinel.instanceName" . }}
+                - name: BUCKET
+                  value: {{ .Values.backup.bucket | quote }}
                 - name: PREFIX
                   value: {{ (.Values.backup.prefix | default (include "redis-sentinel.instanceName" .)) | quote }}
                 - name: RETENTION_DAYS
@@ -118,34 +139,45 @@ spec:
                 - -c
                 - |
                   set -u
-                  # mc alias 配置
-                  ALIAS_ARGS=""
-                  [ "${MC_INSECURE}" = "true" ] && ALIAS_ARGS="--insecure"
-                  mc alias set src "${MC_ENDPOINT}" "${MC_ACCESS_KEY}" "${MC_SECRET_KEY}" ${ALIAS_ARGS} 2>&1 || { echo "[error] mc alias set failed"; exit 1; }
-                  # region 仅 S3 需要, MinIO 可省略, 但设置无害
-                  export MC_REGION="${MC_REGION}"
-
-                  # 确保 prefix 路径存在 (mc cp 不会自动建目录, bucket 必须存在)
-                  # bucket 应由外部预创建; 这里只检查
-                  if ! mc ls "src/${MC_BUCKET}" >/dev/null 2>&1; then
-                    echo "[error] bucket ${MC_BUCKET} not found, please create it first"
+                  # rclone 默认会找 /config/rclone/rclone.conf 并报 NOTICE (即使全用 env)
+                  # 创建空文件让 NOTICE 闭嘴 (env 配置仍优先生效)
+                  mkdir -p /config/rclone && : > /config/rclone/rclone.conf
+                  # bucket 检查 (不创建, 应由外部预建)
+                  if ! rclone lsd dst: >/dev/null 2>&1; then
+                    echo "[error] cannot connect to object storage, check endpoint/credentials"
+                    exit 1
+                  fi
+                  if ! rclone lsf "dst:${BUCKET}" >/dev/null 2>&1; then
+                    echo "[error] bucket ${BUCKET} not found, please create it first"
                     exit 1
                   fi
 
                   TS=$(date -u +%Y%m%d-%H%M%S)
-                  OBJECT="${MC_BUCKET}/${PREFIX}/${INSTANCE_NAME}-dump-${TS}.rdb.gz"
-                  echo "[upload] -> ${OBJECT}"
-                  mc cp ${ALIAS_ARGS} /rdb/dump.rdb.gz "src/${OBJECT}" 2>&1 || { echo "[error] upload failed"; exit 1; }
-                  # 验证上传成功 (mc 镜像精简, 无 awk/grep, 用 stat 退出码判断)
-                  mc stat ${ALIAS_ARGS} "src/${OBJECT}" >/dev/null 2>&1 && echo "[upload] ok, object=${OBJECT}" || { echo "[error] upload verify failed"; exit 1; }
+                  OBJECT_NAME="${INSTANCE_NAME}-dump-${TS}.rdb.gz"
+                  REMOTE_PATH="dst:${BUCKET}/${PREFIX}/${OBJECT_NAME}"
+                  echo "[upload] -> ${REMOTE_PATH}"
+                  # copyto: 单文件到单目标 (避免 copy 的目录遍历语义)
+                  if ! rclone copyto /rdb/dump.rdb.gz "${REMOTE_PATH}" 2>&1; then
+                    echo "[error] upload failed"
+                    exit 1
+                  fi
+                  # 验证: 列出对象, 文件应存在
+                  if ! rclone lsf "${REMOTE_PATH}" >/dev/null 2>&1; then
+                    echo "[error] upload verify failed, object not found"
+                    exit 1
+                  fi
+                  # rclone size --json 输出 {"count":N,"bytes":N}, 用 grep+cut 提取 bytes
+                  SIZE=$(rclone size "${REMOTE_PATH}" --json 2>/dev/null | grep -oE '"bytes":[0-9]+' | cut -d: -f2 || echo 0)
+                  echo "[upload] ok, object=${OBJECT_NAME}, size=${SIZE} bytes"
 
-                  # 保留策略: 删除超过 N 天的备份
-                  echo "[retention] removing backups older than ${RETENTION_DAYS}d under ${MC_BUCKET}/${PREFIX}/"
-                  mc find ${ALIAS_ARGS} "src/${MC_BUCKET}/${PREFIX}/" --older-than "${RETENTION_DAYS}d" --exec "mc rm {}" 2>&1 || true
+                  # 保留策略: 删除 prefix 下超过 N 天的文件 (--min-age 指定最低年龄)
+                  # rclone delete 仅删除文件, 不删目录
+                  echo "[retention] removing backups older than ${RETENTION_DAYS}d under ${BUCKET}/${PREFIX}/"
+                  rclone delete "dst:${BUCKET}/${PREFIX}/" --min-age "${RETENTION_DAYS}d" 2>&1 || true
 
                   # 列出当前备份清单
                   echo "[retention] current backups:"
-                  mc ls ${ALIAS_ARGS} "src/${MC_BUCKET}/${PREFIX}/" 2>&1 | tail -10
+                  rclone lsf "dst:${BUCKET}/${PREFIX}/" 2>&1 | tail -10
               resources:
                 {{- toYaml .Values.backup.resources | nindent 16 }}
           volumes:
