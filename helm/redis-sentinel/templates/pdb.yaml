@@ -15,7 +15,7 @@ spec:
   minAvailable: {{ .Values.pdb.minAvailable }}
   selector:
     matchLabels:
-      app: {{ include "redis-sentinel.redisName" . }}
+      {{- include "redis-sentinel.redisSelectorLabels" . | nindent 6 }}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -29,5 +29,5 @@ spec:
   minAvailable: {{ .Values.pdb.minAvailable }}
   selector:
     matchLabels:
-      app: {{ include "redis-sentinel.sentinelName" . }}
+      {{- include "redis-sentinel.sentinelSelectorLabels" . | nindent 6 }}
 {{- end }}

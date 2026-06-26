@@ -64,6 +64,12 @@
 
 {{/*
   通用 labels
+  注意: app.kubernetes.io/* 是 Helm 标准 label, 但不能直接用作 Service/NetPol/PDB
+  的 selector —— 因为别的 chart 也可能有同名 instance (如另一个 redis chart 用了
+  同 release name). 为彻底隔离, 额外引入 chart 专属 label:
+    redis-sentinel.k8s.io/chart:     chart 标识 (固定值, 区分本 chart 与其他应用)
+    redis-sentinel.k8s.io/instance:  实例名 (区分同 chart 多实例)
+  下面 redisLabels/sentinelLabels 会再加 component label, 让 selector 4 维匹配.
 */}}
 {{- define "redis-sentinel.labels" -}}
 helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
@@ -71,14 +77,20 @@ app.kubernetes.io/name: redis-sentinel
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+redis-sentinel.k8s.io/chart: redis-sentinel
+redis-sentinel.k8s.io/instance: {{ include "redis-sentinel.instanceName" . }}
 {{- end -}}
 
 {{/*
   Redis Pod labels
+  component=redis 与 instance 组成 selector 唯一锁定本实例的 redis pod,
+  不会与集群内任何其他 chart/应用误匹配.
+  redis-role 由 role-tagger sidecar 动态维护 (master|slave), 仅用于 master Service 流量路由.
 */}}
 {{- define "redis-sentinel.redisLabels" -}}
 {{ include "redis-sentinel.labels" . }}
 app: {{ include "redis-sentinel.redisName" . }}
+redis-sentinel.k8s.io/component: redis
 redis-role: slave
 {{- end -}}
 
@@ -88,6 +100,46 @@ redis-role: slave
 {{- define "redis-sentinel.sentinelLabels" -}}
 {{ include "redis-sentinel.labels" . }}
 app: {{ include "redis-sentinel.sentinelName" . }}
+redis-sentinel.k8s.io/component: sentinel
+{{- end -}}
+
+{{/*
+  Redis selector labels (StatefulSet/Service/NetPol/PDB 用)
+  4 维匹配, 彻底隔离: chart + instance + component
+*/}}
+{{- define "redis-sentinel.redisSelectorLabels" -}}
+redis-sentinel.k8s.io/chart: redis-sentinel
+redis-sentinel.k8s.io/instance: {{ include "redis-sentinel.instanceName" . }}
+redis-sentinel.k8s.io/component: redis
+{{- end -}}
+
+{{/*
+  Sentinel selector labels
+*/}}
+{{- define "redis-sentinel.sentinelSelectorLabels" -}}
+redis-sentinel.k8s.io/chart: redis-sentinel
+redis-sentinel.k8s.io/instance: {{ include "redis-sentinel.instanceName" . }}
+redis-sentinel.k8s.io/component: sentinel
+{{- end -}}
+
+{{/*
+  Backup pod labels (CronJob pod template)
+  component=backup 让 NetworkPolicy 6379 ingress 规则能识别并放行 backup pod 访问 master.
+  backup pod 不是 redis/slave, 所以不用 redisSelectorLabels, 而是用独立的 backup selector.
+*/}}
+{{- define "redis-sentinel.backupLabels" -}}
+{{ include "redis-sentinel.labels" . }}
+app: {{ include "redis-sentinel.redisName" . }}
+redis-sentinel.k8s.io/component: backup
+{{- end -}}
+
+{{/*
+  Backup selector labels (NetworkPolicy 用, 放行 backup pod 访问 master:6379)
+*/}}
+{{- define "redis-sentinel.backupSelectorLabels" -}}
+redis-sentinel.k8s.io/chart: redis-sentinel
+redis-sentinel.k8s.io/instance: {{ include "redis-sentinel.instanceName" . }}
+redis-sentinel.k8s.io/component: backup
 {{- end -}}
 
 {{/*

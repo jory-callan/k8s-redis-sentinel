@@ -24,18 +24,24 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: {{ include "redis-sentinel.redisName" . }}
+      {{- include "redis-sentinel.redisSelectorLabels" . | nindent 6 }}
   policyTypes:
     - Ingress
   ingress:
     # 6379: 同实例 redis + sentinel pod (复制 / sentinel 监控 / role-tagger localhost 不受限)
+    #       + backup pod (redis-cli --rdb 拉取快照)
     - from:
         - podSelector:
             matchLabels:
-              app: {{ include "redis-sentinel.redisName" . }}
+              {{- include "redis-sentinel.redisSelectorLabels" . | nindent 14 }}
         - podSelector:
             matchLabels:
-              app: {{ include "redis-sentinel.sentinelName" . }}
+              {{- include "redis-sentinel.sentinelSelectorLabels" . | nindent 14 }}
+        {{- if .Values.backup.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "redis-sentinel.backupSelectorLabels" . | nindent 14 }}
+        {{- end }}
       ports:
         - port: 6379
           protocol: TCP
@@ -87,7 +93,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: {{ include "redis-sentinel.sentinelName" . }}
+      {{- include "redis-sentinel.sentinelSelectorLabels" . | nindent 6 }}
   policyTypes:
     - Ingress
   ingress:
@@ -95,10 +101,10 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              app: {{ include "redis-sentinel.redisName" . }}
+              {{- include "redis-sentinel.redisSelectorLabels" . | nindent 14 }}
         - podSelector:
             matchLabels:
-              app: {{ include "redis-sentinel.sentinelName" . }}
+              {{- include "redis-sentinel.sentinelSelectorLabels" . | nindent 14 }}
       ports:
         - port: 26379
           protocol: TCP

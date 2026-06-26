@@ -14,7 +14,7 @@ spec:
   podManagementPolicy: Parallel
   selector:
     matchLabels:
-      app: {{ include "redis-sentinel.redisName" . }}
+      {{- include "redis-sentinel.redisSelectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
@@ -33,7 +33,7 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: {{ include "redis-sentinel.redisName" . }}
+                    {{- include "redis-sentinel.redisSelectorLabels" . | nindent 18 }}
                 topologyKey: kubernetes.io/hostname
       {{- end }}
       containers:

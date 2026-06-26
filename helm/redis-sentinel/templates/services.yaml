@@ -25,7 +25,7 @@ spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector:
-    app: {{ include "redis-sentinel.redisName" . }}
+    {{- include "redis-sentinel.redisSelectorLabels" . | nindent 4 }}
   ports:
     - name: redis
       port: 6379
@@ -45,7 +45,7 @@ metadata:
 spec:
   type: {{ .Values.service.type }}
   selector:
-    app: {{ include "redis-sentinel.redisName" . }}
+    {{- include "redis-sentinel.redisSelectorLabels" . | nindent 4 }}
     redis-role: master
   ports:
     - name: redis
@@ -70,7 +70,7 @@ spec:
   type: {{ .Values.service.type }}
   publishNotReadyAddresses: true
   selector:
-    app: {{ include "redis-sentinel.redisName" . }}
+    {{- include "redis-sentinel.redisSelectorLabels" . | nindent 4 }}
   ports:
     - name: redis
       port: 6379
@@ -92,7 +92,7 @@ metadata:
 spec:
   clusterIP: None
   selector:
-    app: {{ include "redis-sentinel.sentinelName" . }}
+    {{- include "redis-sentinel.sentinelSelectorLabels" . | nindent 4 }}
   ports:
     - name: sentinel
       port: 26379
@@ -110,7 +110,7 @@ metadata:
     app: {{ include "redis-sentinel.redisName" . }}
 spec:
   selector:
-    app: {{ include "redis-sentinel.redisName" . }}
+    {{- include "redis-sentinel.redisSelectorLabels" . | nindent 4 }}
   ports:
     - name: metrics
       port: 9121
@@ -129,7 +129,7 @@ metadata:
     app: {{ include "redis-sentinel.sentinelName" . }}
 spec:
   selector:
-    app: {{ include "redis-sentinel.sentinelName" . }}
+    {{- include "redis-sentinel.sentinelSelectorLabels" . | nindent 4 }}
   ports:
     - name: metrics
       port: 9121

@@ -18,10 +18,7 @@ spec:
       template:
         metadata:
           labels:
-            {{- include "redis-sentinel.labels" . | nindent 12 }}
-            # app=<instance> 让 NetworkPolicy 放行 backup pod 访问 master:6379
-            # (NetworkPolicy ingress 6379 规则放行 app=<instance> 的 pod)
-            app: {{ include "redis-sentinel.redisName" . }}
+            {{- include "redis-sentinel.backupLabels" . | nindent 12 }}
         spec:
           restartPolicy: OnFailure
           # 备份只通过 Service 网络访问 redis + 对象存储, 不调用 K8s API
