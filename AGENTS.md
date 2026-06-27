@@ -94,8 +94,12 @@
 
 1. **资源名含实例前缀**: 所有资源名以 `<instance>` 开头，支持多实例隔离。
 2. **label 规范**:
-   - `app: <instance>` 或 `app: <instance>-sentinel`
+   - `app: <instance>` 或 `app: <instance>-sentinel`（向后兼容，可读性）
+   - `redis-sentinel.k8s.io/chart: redis-sentinel`（chart 标识，固定值）
+   - `redis-sentinel.k8s.io/instance: <instance>`（实例隔离，用于 selector）
+   - `redis-sentinel.k8s.io/component: redis|sentinel|backup`（组件区分，用于 selector）
    - `redis-role: master|slave`（仅 Redis pod，由 role-tagger 维护）
+   - 所有 Service/StatefulSet/NetworkPolicy/PDB selector 使用 `redis-sentinel.k8s.io/*` 四元组，避免与集群内其他应用冲突
 3. **Pod 管理策略**: 一律 `Parallel`，防脑裂逻辑在脚本层。
 4. **探针**: startup/readiness/liveness 三件套，startup 给足冷启动时间。
 5. **checksum/config 注解**: ConfigMap 变更时自动滚动重启 Pod。

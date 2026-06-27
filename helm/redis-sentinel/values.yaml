@@ -1,6 +1,13 @@
 # ═══════════════════════════════════════════════════════════════
 # Redis-Sentinel Helm Chart — Values
 #
+# ⚠️  UPGRADE WARNING: Chart v1.0+ changed Service/StatefulSet
+#     selector labels from `app=<instance>` to `redis-sentinel.k8s.io/*`.
+#     Existing deployments MUST be deleted and reinstalled:
+#       helm uninstall <release> -n <ns>
+#       helm install <release> ./helm/redis-sentinel -n <ns> -f values.yaml
+#     Direct helm upgrade will fail with "selector is immutable" error.
+#
 # 结构: common (共享) + redis (Redis pod) + sentinel (Sentinel pod)
 # 每个 pod 下含: image / replicas / resources / exporter / config / probes
 #

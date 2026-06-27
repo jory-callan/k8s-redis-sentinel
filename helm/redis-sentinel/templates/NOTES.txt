@@ -3,10 +3,15 @@
   Namespace: {{ .Release.Namespace }}
 ═══════════════════════════════════════════════════════════════
 
+⚠️  UPGRADE WARNING: Chart v1.0+ changed Service/StatefulSet selector labels
+    from `app=<instance>` to `redis-sentinel.k8s.io/*`. Existing deployments
+    MUST be deleted and reinstalled (helm uninstall → helm install).
+    Direct helm upgrade will fail with "selector is immutable" error.
+
 1. Wait for pods to be ready:
 
   kubectl -n {{ .Release.Namespace }} wait pod --for=condition=Ready \
-    -l "app in ({{ include "redis-sentinel.redisName" . }},{{ include "redis-sentinel.sentinelName" . }})" --timeout=300s
+    -l "redis-sentinel.k8s.io/instance={{ include "redis-sentinel.instanceName" . }}" --timeout=300s
 
 2. Connection info:
 
@@ -41,7 +46,7 @@
 
 4. Verify cluster state:
 
-  kubectl -n {{ $ns }} get pods -l "app in ({{ $inst }},{{ $inst }}-sentinel)" -o wide
+  kubectl -n {{ $ns }} get pods -l "redis-sentinel.k8s.io/instance={{ $inst }}" -o wide
   kubectl -n {{ $ns }} exec {{ $inst }}-sentinel-0 -- redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
 
 5. {{- if eq .Values.service.type "NodePort" }} NodePort access:{{ else }} Expose externally (optional):{{ end }}
@@ -52,5 +57,5 @@
     Read:   <node-ip>:{{ .Values.service.nodePort.read | default "<auto>" }}
   {{- else }}
   Set service.type=NodePort or create your own Service with selector:
-    app={{ $inst }}, redis-role=master
+    redis-sentinel.k8s.io/instance={{ $inst }}, redis-sentinel.k8s.io/component=redis, redis-role=master
   {{- end }}

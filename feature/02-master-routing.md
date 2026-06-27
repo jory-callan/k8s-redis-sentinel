@@ -33,7 +33,9 @@ readinessProbe: ROLE | grep master
 ┌──────────────────────────────────────────────────────────────┐
 │  Service <inst>-master                                       │
 │  selector:                                                   │
-│    app: <inst>                                               │
+│    redis-sentinel.k8s.io/chart: redis-sentinel               │
+│    redis-sentinel.k8s.io/instance: <inst>                   │
+│    redis-sentinel.k8s.io/component: redis                    │
 │    redis-role: master   ← 只选 master pod                     │
 └──────────────────────────────────────────────────────────────┘
                   ↑

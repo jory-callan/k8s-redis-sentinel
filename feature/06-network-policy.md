@@ -49,10 +49,11 @@
 
 ```yaml
 ingress:
-  # 同实例 redis + sentinel (复制 / sentinel 监控)
+  # 同实例 redis + sentinel + backup (复制 / sentinel 监控 / rdb 拉取)
   - from:
-      - podSelector: { matchLabels: { app: <inst> } }
-      - podSelector: { matchLabels: { app: <inst>-sentinel } }
+      - podSelector: { matchLabels: { redis-sentinel.k8s.io/instance: <inst>, redis-sentinel.k8s.io/component: redis } }
+      - podSelector: { matchLabels: { redis-sentinel.k8s.io/instance: <inst>, redis-sentinel.k8s.io/component: sentinel } }
+      - podSelector: { matchLabels: { redis-sentinel.k8s.io/instance: <inst>, redis-sentinel.k8s.io/component: backup } }
     ports: [{ port: 6379 }]
 
   # 业务 pod (跨 namespace, 由 redisIngressFrom 配置)
@@ -81,8 +82,8 @@ ingress:
 
 ```yaml
 - from:
-    - podSelector: { matchLabels: { app: <inst> } }        # redis pod (startup 查询)
-    - podSelector: { matchLabels: { app: <inst>-sentinel } } # sentinel (互连/选举)
+    - podSelector: { matchLabels: { redis-sentinel.k8s.io/instance: <inst>, redis-sentinel.k8s.io/component: redis } }        # redis pod (startup 查询)
+    - podSelector: { matchLabels: { redis-sentinel.k8s.io/instance: <inst>, redis-sentinel.k8s.io/component: sentinel } } # sentinel (互连/选举)
   ports: [{ port: 26379 }]
 ```
 
