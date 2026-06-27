@@ -65,14 +65,15 @@ data:
       i=0
       while [ "$i" -lt 5 ]; do
         i=$((i + 1))
-        for s in ${INSTANCE_NAME}-sentinel-0 ${INSTANCE_NAME}-sentinel-1 ${INSTANCE_NAME}-sentinel-2; do
-          H="${s}.${SENTINEL_HL}.${NAMESPACE}.svc"
-          IP="$(cli -h "${H}" -p 26379 SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -1)"
-          if [ -n "${IP}" ] && [ "${IP}" != "nil" ]; then
-            echo "${IP}"
-            return 0
-          fi
-        done
+        {{- range $i := until (int .Values.sentinel.replicas) }}
+        s="${INSTANCE_NAME}-sentinel-{{ $i }}"
+        H="${s}.${SENTINEL_HL}.${NAMESPACE}.svc"
+        IP="$(cli -h "${H}" -p 26379 SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -1)"
+        if [ -n "${IP}" ] && [ "${IP}" != "nil" ]; then
+          echo "${IP}"
+          return 0
+        fi
+        {{- end }}
         sleep 3
       done
       return 1
