@@ -66,6 +66,10 @@ spec:
                   key: redis-password
                   optional: true
             {{- end }}
+            - name: REDIS_REPLICAS
+              value: {{ .Values.redis.replicas | quote }}
+            - name: SENTINEL_REPLICAS
+              value: {{ .Values.sentinel.replicas | quote }}
           # startupProbe: generous timeout for cold start
           startupProbe:
             exec:
