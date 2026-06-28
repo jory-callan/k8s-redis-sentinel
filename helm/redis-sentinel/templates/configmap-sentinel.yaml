@@ -16,6 +16,10 @@ data:
     INSTANCE_NAME="${INSTANCE_NAME:-redis}"
     MY_IP="${POD_IP:-$(hostname -i | awk '{print $1}')}"
 
+    # Dynamic replicas configuration
+    REDIS_REPLICAS="${REDIS_REPLICAS:-3}"
+    SENTINEL_REPLICAS="${SENTINEL_REPLICAS:-3}"
+
     # Derived names (must match services.yaml)
     REDIS_HL="${INSTANCE_NAME}-hl"
     SENTINEL_HL="${INSTANCE_NAME}-sentinel-hl"
@@ -35,8 +39,10 @@ data:
 
     # ── Find master: ask other sentinels, then scan redis pods ──
     find_master() {
-      # 1. Ask other sentinels
-      for s in ${INSTANCE_NAME}-sentinel-0 ${INSTANCE_NAME}-sentinel-1 ${INSTANCE_NAME}-sentinel-2; do
+      # 1. Ask other sentinels (dynamic loop)
+      sentinel_idx=0
+      while [ "$sentinel_idx" -lt "$SENTINEL_REPLICAS" ]; do
+        s="${INSTANCE_NAME}-sentinel-${sentinel_idx}"
         H="${s}.${SENTINEL_HL}.${NAMESPACE}.svc"
         IP="$(cli -h "${H}" -p 26379 SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -1)"
         if [ -n "${IP}" ] && [ "${IP}" != "nil" ]; then
@@ -47,9 +53,12 @@ data:
             return 0
           fi
         fi
+        sentinel_idx=$((sentinel_idx + 1))
       done
-      # 2. Scan redis pods for ROLE=master
-      for r in ${INSTANCE_NAME}-0 ${INSTANCE_NAME}-1 ${INSTANCE_NAME}-2; do
+      # 2. Scan redis pods for ROLE=master (dynamic loop)
+      redis_idx=0
+      while [ "$redis_idx" -lt "$REDIS_REPLICAS" ]; do
+        r="${INSTANCE_NAME}-${redis_idx}"
         H="${r}.${REDIS_HL}.${NAMESPACE}.svc"
         ROLE="$(cli -h "${H}" -p 6379 ROLE 2>/dev/null | head -1)"
         if [ "${ROLE}" = "master" ]; then
@@ -59,6 +68,7 @@ data:
             return 0
           fi
         fi
+        redis_idx=$((redis_idx + 1))
       done
       return 1
     }
@@ -86,6 +96,18 @@ data:
     fi
 
     echo "[sentinel] monitoring ${MASTER_IP}:6379"
+
+    # Clean up stale sentinel.conf entries to avoid ghost slaves
+    # When redis pod restarts with new IP, old 'sentinel known-slave' entries
+    # remain in persistent sentinel.conf, causing slave count to grow indefinitely.
+    # Delete old known-slave entries before generating new config.
+    if [ -f /data/sentinel.conf ]; then
+      OLD_SLAVES=$(grep -c '^sentinel known-slave mymaster' /data/sentinel.conf 2>/dev/null || echo 0)
+      if [ "${OLD_SLAVES}" -gt 0 ]; then
+        echo "[sentinel] cleaning ${OLD_SLAVES} stale known-slave entries from sentinel.conf"
+        sed -i '/^sentinel known-slave mymaster/d' /data/sentinel.conf
+      fi
+    fi
 
     # ── Generate sentinel.conf ────────────────────────
     {
