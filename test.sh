@@ -38,6 +38,10 @@ PASS="test-${INSTANCE}-123"
 RELEASE="$INSTANCE"
 MASTER_SVC="${INSTANCE}-master"
 
+# 从 values.yaml 读取副本数 (避免硬编码)
+REDIS_REPLICAS=$(grep "^  replicas:" "${CHART_DIR}/values.yaml" | head -1 | awk '{print $2}')
+REDIS_REPLICAS="${REDIS_REPLICAS:-3}"
+
 # 快速 failover 参数 (用于稳定性测试)
 FAST_FAILOVER_ARGS=(
   --set "sentinel.config[0]=sentinel down-after-milliseconds mymaster 1000"
@@ -141,7 +145,7 @@ data_integrity_test() {
   # 阶段3: 删除 master 触发 failover
   info "阶段3: 删除 master 触发 failover"
   local old_master_pod
-  for i in 0 1 2; do
+  for ((i=0; i<REDIS_REPLICAS; i++)); do
     pod="${INSTANCE}-${i}"
     ip=$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.podIP}' 2>/dev/null)
     if [ "$ip" = "$old_master_ip" ]; then
@@ -251,7 +255,7 @@ client_reconnect_test() {
   
   # 获取当前 master
   local old_master
-  for i in 0 1 2; do
+  for ((i=0; i<REDIS_REPLICAS; i++)); do
     pod="${INSTANCE}-${i}"
     role="$(rcli "$pod" role 2>/dev/null | head -1)"
     if [ "$role" = "master" ]; then
@@ -388,7 +392,7 @@ verify() {
   # 1. master 存在
   info "检查 redis 角色..."
   local master_pod="" master_ip=""
-  for i in 0 1 2; do
+  for ((i=0; i<REDIS_REPLICAS; i++)); do
     pod="${INSTANCE}-${i}"
     role="$(rcli "$pod" role 2>/dev/null | head -1 || echo '?')"
     echo "    $pod: $role"
@@ -442,7 +446,7 @@ failover_test() {
 
   # 找当前 master
   old_master="" old_ip=""
-  for i in 0 1 2; do
+  for ((i=0; i<REDIS_REPLICAS; i++)); do
     pod="${INSTANCE}-${i}"
     role="$(rcli "$pod" role 2>/dev/null | head -1 || echo '')"
     if [ "$role" = "master" ]; then
@@ -462,7 +466,7 @@ failover_test() {
   info "等待 failover..."
   new_master="" new_ip="" elapsed=0
   while [ "$elapsed" -lt 60 ]; do
-    for i in 0 1 2; do
+    for ((i=0; i<REDIS_REPLICAS; i++)); do
       pod="${INSTANCE}-${i}"
       [ "$pod" = "$old_master" ] && continue
       role="$(rcli "$pod" role 2>/dev/null | head -1 || echo '')"
@@ -492,7 +496,7 @@ failover_test() {
   # 拓扑
   info "最终拓扑:"
   m_count=0 s_count=0
-  for i in 0 1 2; do
+  for ((i=0; i<REDIS_REPLICAS; i++)); do
     pod="${INSTANCE}-${i}"
     role="$(rcli "$pod" role 2>/dev/null | head -1 || echo '?')"
     echo "    $pod: $role"
@@ -521,7 +525,7 @@ master_switch_test() {
   # 场景1: 获取当前 master (不假设必须是 -0)
   info "场景1: 获取当前 master"
   local current_master=""
-  for i in 0 1 2; do
+  for ((i=0; i<REDIS_REPLICAS; i++)); do
     pod="${INSTANCE}-${i}"
     role="$(rcli "$pod" role 2>/dev/null | head -1)"
     if [ "$role" = "master" ]; then
@@ -542,7 +546,7 @@ master_switch_test() {
   new_master=""
   local elapsed=0
   while [ "$elapsed" -lt 20 ]; do
-    for i in 0 1 2; do
+    for ((i=0; i<REDIS_REPLICAS; i++)); do
       pod="${INSTANCE}-${i}"
       [ "$pod" = "$current_master" ] && continue
       role="$(rcli "$pod" role 2>/dev/null | head -1 || echo '')"
@@ -569,15 +573,19 @@ master_switch_test() {
   info "场景3: 删除当前 master ($new_master)，验证其他节点可以成为 master"
   kubectl -n "$NS" delete pod "$new_master" --force --grace-period=0 2>/dev/null | grep deleted
   new_master2=""
-  for i in 0 1 2; do
-    pod="${INSTANCE}-${i}"
-    [ "$pod" = "$new_master" ] && continue
-    sleep 3
-    role="$(rcli "$pod" role 2>/dev/null | head -1 || echo '')"
-    if [ "$role" = "master" ]; then
-      new_master2="$pod"
-      break
-    fi
+  local elapsed3=0
+  while [ "$elapsed3" -lt 20 ]; do
+    for ((i=0; i<REDIS_REPLICAS; i++)); do
+      pod="${INSTANCE}-${i}"
+      [ "$pod" = "$new_master" ] && continue
+      role="$(rcli "$pod" role 2>/dev/null | head -1 || echo '')"
+      if [ "$role" = "master" ]; then
+        new_master2="$pod"
+        break 2
+      fi
+    done
+    sleep 2
+    elapsed3=$((elapsed3+2))
   done
   if [ -n "$new_master2" ]; then
     ok "新 master: $new_master2"
@@ -592,7 +600,7 @@ master_switch_test() {
   kubectl -n "$NS" wait pod --for=condition=Ready -l "app=${INSTANCE}" --timeout=120s 2>/dev/null
   sleep 5
   m_count=0 s_count=0
-  for i in 0 1 2; do
+  for ((i=0; i<REDIS_REPLICAS; i++)); do
     pod="${INSTANCE}-${i}"
     role="$(rcli "$pod" role 2>/dev/null | head -1 || echo '?')"
     echo "    $pod: $role"
