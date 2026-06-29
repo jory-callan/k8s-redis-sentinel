@@ -287,6 +287,98 @@ failover_test() {
   ERRORS=$((ERRORS+errors))
 }
 
+# ── Master 灵活切换测试 ──────────────────────────────────────────
+# 验证：master 可以是任意节点，不是固定 -0
+
+master_switch_test() {
+  hdr "Master 灵活切换测试 (验证任意节点可成为 master)"
+  local errors=0
+
+  # 场景1: 确认初始 master 是 -0 (冷启动默认)
+  info "场景1: 初始状态"
+  role="$(rcli "${INSTANCE}-0" role 2>/dev/null | head -1)"
+  if [ "$role" = "master" ]; then
+    ok "初始 master: ${INSTANCE}-0"
+  else
+    bad "初始 master 不是 ${INSTANCE}-0 (role=$role)"
+    errors=$((errors+1))
+  fi
+
+  # 场景2: 删除 -0，验证 -1 或 -2 成为 master
+  info "场景2: 删除 ${INSTANCE}-0，验证其他节点成为 master"
+  kubectl -n "$NS" delete pod "${INSTANCE}-0" --force --grace-period=0 2>/dev/null | grep deleted
+  new_master=""
+  for i in 0 1 2; do
+    pod="${INSTANCE}-${i}"
+    [ "$pod" = "${INSTANCE}-0" ] && continue
+    sleep 3
+    role="$(rcli "$pod" role 2>/dev/null | head -1 || echo '')"
+    if [ "$role" = "master" ]; then
+      new_master="$pod"
+      break
+    fi
+  done
+  if [ -n "$new_master" ]; then
+    ok "新 master: $new_master (证明 master 不固定为 -0)"
+  else
+    bad "删除 -0 后无新 master (master 固定问题)"
+    errors=$((errors+1))
+  fi
+
+  # 等待 -0 恢复
+  kubectl -n "$NS" wait pod "${INSTANCE}-0" --for=condition=Ready --timeout=120s 2>/dev/null
+  sleep 5
+
+  # 场景3: 删除当前 master (可能是 -1 或 -2)，验证 -0 可以成为 master
+  info "场景3: 删除当前 master ($new_master)，验证 -0 可以成为 master"
+  kubectl -n "$NS" delete pod "$new_master" --force --grace-period=0 2>/dev/null | grep deleted
+  new_master2=""
+  for i in 0 1 2; do
+    pod="${INSTANCE}-${i}"
+    [ "$pod" = "$new_master" ] && continue
+    sleep 3
+    role="$(rcli "$pod" role 2>/dev/null | head -1 || echo '')"
+    if [ "$role" = "master" ]; then
+      new_master2="$pod"
+      break
+    fi
+  done
+  if [ -n "$new_master2" ]; then
+    ok "新 master: $new_master2"
+    if [ "$new_master2" = "${INSTANCE}-0" ]; then
+      ok "✓ 证明 -0 可以重新成为 master"
+    else
+      ok "✓ 证明 master 可以是任意节点"
+    fi
+  else
+    bad "删除 $new_master 后无新 master"
+    errors=$((errors+1))
+  fi
+
+  # 场景4: 验证最终拓扑
+  info "场景4: 最终拓扑验证"
+  kubectl -n "$NS" wait pod --for=condition=Ready -l "app=${INSTANCE}" --timeout=120s 2>/dev/null
+  sleep 5
+  m_count=0 s_count=0
+  for i in 0 1 2; do
+    pod="${INSTANCE}-${i}"
+    role="$(rcli "$pod" role 2>/dev/null | head -1 || echo '?')"
+    echo "    $pod: $role"
+    case "$role" in
+      master) m_count=$((m_count+1)) ;;
+      slave)  s_count=$((s_count+1)) ;;
+    esac
+  done
+  [ "$m_count" -eq 1 ] && [ "$s_count" -eq 2 ] && ok "拓扑: 1 master + 2 slaves" || { bad "拓扑异常: ${m_count}m+${s_count}s"; errors=$((errors+1)); }
+
+  # 读写测试
+  check_rw || errors=$((errors+1))
+
+  echo ""
+  [ "$errors" -eq 0 ] && ok "Master 灵活切换测试通过" || bad "$errors 个检查失败"
+  ERRORS=$((ERRORS+errors))
+}
+
 # ── 稳定性测试 (9 个场景 + RBAC) ────────────────────────────────
 
 stability_test() {
@@ -474,22 +566,25 @@ case "$MODE" in
   install)   install ;;
   verify)    verify ;;
   failover)  failover_test ;;
+  master-switch) install; master_switch_test; cleanup ;;
   stability) install; stability_test; cleanup ;;
   cleanup)   cleanup ;;
   full)
     install
     verify
     failover_test
+    master_switch_test
     cleanup
     ;;
   *)
-    echo "Usage: $0 [INSTANCE] [NAMESPACE] [full|install|verify|failover|stability|cleanup]"
+    echo "Usage: $0 [INSTANCE] [NAMESPACE] [full|install|verify|failover|master-switch|stability|cleanup]"
     echo ""
     echo "Modes:"
-    echo "  full       部署 → 验证 → failover → 清理 (默认)"
-    echo "  install    仅部署"
-    echo "  verify     仅验证"
-    echo "  failover   仅 failover 测试"
+    echo "  full          部署 → 验证 → failover → master-switch → 清理 (默认)"
+    echo "  install       仅部署"
+    echo "  verify        仅验证"
+    echo "  failover      仅 failover 测试"
+    echo "  master-switch 仅 master 灵活切换测试"
     echo "  stability  完整稳定性测试 (9 场景 + RBAC)"
     echo "  cleanup    仅清理"
     echo ""
