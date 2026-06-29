@@ -115,11 +115,14 @@ fi
   echo "daemonize no"
   echo "pidfile /data/sentinel.pid"
   echo 'logfile ""'
-  echo "dir /tmp"
+  echo "dir /data"
   echo "protected-mode no"
-  echo "sentinel monitor mymaster ${MASTER_IP} 6379 2"
+  echo "sentinel monitor mymaster ${MASTER_IP} 6379 ${QUORUM:-2}"
   echo "sentinel announce-ip ${MY_IP}"
   echo "sentinel announce-port 26379"
+  echo "sentinel down-after-milliseconds mymaster 1000"
+  echo "sentinel failover-timeout mymaster 5000"
+  echo "sentinel parallel-syncs mymaster 1"
   if [ -n "${REDIS_PASSWORD:-}" ]; then
     echo "requirepass ${REDIS_PASSWORD}"
     echo "sentinel auth-pass mymaster ${REDIS_PASSWORD}"

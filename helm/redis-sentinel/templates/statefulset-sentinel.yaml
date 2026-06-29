@@ -67,6 +67,8 @@ spec:
               value: {{ .Values.redis.replicas | quote }}
             - name: SENTINEL_REPLICAS
               value: {{ .Values.sentinel.replicas | quote }}
+            - name: QUORUM
+              value: {{ .Values.sentinel.quorum | quote }}
           # startupProbe: sentinel discovery can take up to 200s
           startupProbe:
             exec:
