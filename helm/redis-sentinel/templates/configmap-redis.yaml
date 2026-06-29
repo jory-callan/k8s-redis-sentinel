@@ -35,6 +35,10 @@ data:
     REDIS_HL="${INSTANCE_NAME}-hl"
     SENTINEL_HL="${INSTANCE_NAME}-sentinel-hl"
 
+    # 动态 replicas 配置（由 StatefulSet 环境变量注入）
+    REDIS_REPLICAS="${REDIS_REPLICAS:-3}"
+    SENTINEL_REPLICAS="${SENTINEL_REPLICAS:-3}"
+
     echo "[startup] instance=${INSTANCE_NAME} ordinal=${ORDINAL} ip=${MY_IP}"
 
     # ── Build redis.conf ──────────────────────────────
@@ -75,6 +79,46 @@ data:
         fi
         {{- end }}
         sleep 3
+      done
+      return 1
+    }
+
+    # ── Quick sentinel check (single pass, no internal retries) ────
+    # 用于 cold-start 循环：每次迭代做一次快速检查
+    get_master_from_sentinel_quick() {
+      sentinel_idx=0
+      while [ "$sentinel_idx" -lt "$SENTINEL_REPLICAS" ]; do
+        s="${INSTANCE_NAME}-sentinel-${sentinel_idx}"
+        H="${s}.${SENTINEL_HL}.${NAMESPACE}.svc"
+        IP="$(cli -h "${H}" -p 26379 SENTINEL get-master-addr-by-name mymaster 2>/dev/null | head -1)"
+        if [ -n "${IP}" ] && [ "${IP}" != "nil" ]; then
+          echo "${IP}"
+          return 0
+        fi
+        sentinel_idx=$((sentinel_idx + 1))
+      done
+      return 1
+    }
+
+    # ── Scan all redis pods via DNS for a master ────
+    # IP 无关：使用 StatefulSet 稳定 DNS 名，即使 pod IP 变化也能找到 master
+    scan_redis_for_master() {
+      redis_idx=0
+      while [ "$redis_idx" -lt "$REDIS_REPLICAS" ]; do
+        if [ "$redis_idx" -eq "$ORDINAL" ]; then
+          redis_idx=$((redis_idx + 1))
+          continue
+        fi
+        r="${INSTANCE_NAME}-${redis_idx}"
+        H="${r}.${REDIS_HL}.${NAMESPACE}.svc"
+        if cli -h "${H}" -p 6379 PING 2>/dev/null | grep -q PONG; then
+          ROLE="$(cli -h "${H}" -p 6379 ROLE 2>/dev/null | head -1)"
+          if [ "${ROLE}" = "master" ]; then
+            echo "${H}"
+            return 0
+          fi
+        fi
+        redis_idx=$((redis_idx + 1))
       done
       return 1
     }
@@ -126,19 +170,39 @@ data:
       exec redis-server /data/redis.conf
     fi
 
-    # ordinal > 0: wait for redis-0 (NEVER self-promote — prevents split-brain)
-    REDIS_0="${INSTANCE_NAME}-0.${REDIS_HL}.${NAMESPACE}.svc"
-    echo "[cold] waiting for ${REDIS_0} to become master..."
+    # ordinal > 0: find any available master (NEVER self-promote — prevents split-brain)
+    # Three strategies in priority order:
+    #   1. Re-check sentinel (quick single pass — may have completed failover during restart)
+    #   2. Scan all redis pods via DNS (handles IP changes, stale sentinel data)
+    #   3. Retry loop (wait for any master to appear, including redis-0 self-bootstrap)
+    echo "[cold] ordinal=${ORDINAL}, searching for master..."
     i=0
     while [ "$i" -lt 30 ]; do
       i=$((i + 1))
-      if cli -h "${REDIS_0}" -p 6379 PING 2>/dev/null | grep -q PONG; then
-        echo "[role] slave of ${REDIS_0} (cold start)"
-        exec redis-server /data/redis.conf --slaveof "${REDIS_0}" 6379
+
+      # Strategy 1: Quick sentinel re-check
+      MASTER_IP_QUICK="$(get_master_from_sentinel_quick)"
+      if [ -n "${MASTER_IP_QUICK}" ]; then
+        if [ "${MASTER_IP_QUICK}" = "${MY_IP}" ]; then
+          echo "[cold] sentinel says I am master"
+          exec redis-server /data/redis.conf
+        fi
+        if cli -h "${MASTER_IP_QUICK}" -p 6379 PING 2>/dev/null | grep -q PONG; then
+          echo "[cold] found master via sentinel: ${MASTER_IP_QUICK}"
+          exec redis-server /data/redis.conf --slaveof "${MASTER_IP_QUICK}" 6379
+        fi
       fi
+
+      # Strategy 2: Scan all redis pods via DNS (IP-independent)
+      MASTER_HOST="$(scan_redis_for_master)"
+      if [ -n "${MASTER_HOST}" ]; then
+        echo "[cold] found master via scan: ${MASTER_HOST}"
+        exec redis-server /data/redis.conf --slaveof "${MASTER_HOST}" 6379
+      fi
+
       sleep 2
     done
 
-    # Cannot reach redis-0 — crash (K8s restarts). Do NOT become standalone master.
-    echo "[error] cannot reach ${REDIS_0} after 60s, exiting"
+    # Cannot find any master — crash (K8s restarts). Do NOT become standalone master.
+    echo "[error] cannot find master after 60s, exiting"
     exit 1
