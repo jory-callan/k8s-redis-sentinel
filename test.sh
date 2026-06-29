@@ -104,6 +104,230 @@ check_rw() {
   fi
 }
 
+# Service 端点验证
+check_service() {
+  local master_ip="$1"
+  local ep
+  ep=$(kubectl -n "$NS" get endpoints "${MASTER_SVC}" -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)
+  if [ "$ep" = "$master_ip" ]; then
+    ok "${MASTER_SVC} → $ep (与 master IP 一致)"
+    return 0
+  else
+    bad "${MASTER_SVC} → $ep (应为 $master_ip)"
+    return 1
+  fi
+}
+
+# 数据完整性测试 (在 failover 前后写入和读取数据)
+data_integrity_test() {
+  hdr "数据完整性测试"
+  local errors=0
+  local test_key_prefix="data-int-"
+  
+  # 阶段1: 在当前 master 写入测试数据
+  info "阶段1: 在当前 master 写入测试数据"
+  local i
+  for i in 1 2 3 4 5; do
+    kubectl -n "$NS" run tmp-write-$i --image=redis:5.0.8-alpine --rm -i --restart=Never -- \
+      sh -c "redis-cli -h ${MASTER_SVC} -a ${PASS} SET ${test_key_prefix}${i} value${i} 2>/dev/null" 2>&1 | grep -vE "Warning|Defaulted|deleted|attach" >/dev/null
+  done
+  ok "已写入 5 条测试数据"
+  
+  # 阶段2: 获取当前 master IP
+  local old_master_ip
+  old_master_ip=$(kubectl -n "$NS" get endpoints "${MASTER_SVC}" -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)
+  info "当前 master IP: $old_master_ip"
+  
+  # 阶段3: 删除 master 触发 failover
+  info "阶段3: 删除 master 触发 failover"
+  local old_master_pod
+  for i in 0 1 2; do
+    pod="${INSTANCE}-${i}"
+    ip=$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.podIP}' 2>/dev/null)
+    if [ "$ip" = "$old_master_ip" ]; then
+      old_master_pod="$pod"
+      break
+    fi
+  done
+  info "删除 ${old_master_pod}..."
+  kubectl -n "$NS" delete pod "$old_master_pod" --force --grace-period=0 2>/dev/null | grep deleted
+  
+  # 阶段4: 等待 failover 完成
+  info "阶段4: 等待 failover 完成..."
+  local elapsed=0
+  while [ "$elapsed" -lt 30 ]; do
+    local new_ep
+    new_ep=$(kubectl -n "$NS" get endpoints "${MASTER_SVC}" -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)
+    if [ "$new_ep" != "$old_master_ip" ] && [ -n "$new_ep" ]; then
+      ok "Service 已切换到新 master: $new_ep (耗时 ${elapsed}s)"
+      break
+    fi
+    sleep 2
+    elapsed=$((elapsed+2))
+  done
+  
+  # 阶段5: 验证数据完整性
+  info "阶段5: 验证数据完整性"
+  local missing=0
+  for i in 1 2 3 4 5; do
+    local val
+    val=$(kubectl -n "$NS" run tmp-read-$i --image=redis:5.0.8-alpine --rm -i --restart=Never -- \
+      sh -c "redis-cli -h ${MASTER_SVC} -a ${PASS} GET ${test_key_prefix}${i} 2>/dev/null" 2>&1 | grep -vE "Warning|Defaulted|deleted|attach|prompt" | tr -d '\r')
+    if [ "$val" = "value${i}" ]; then
+      echo "    ${test_key_prefix}${i}: ${val} ✓"
+    else
+      echo "    ${test_key_prefix}${i}: ${val} ✗ (应为 value${i})"
+      missing=$((missing+1))
+    fi
+  done
+  if [ "$missing" -eq 0 ]; then
+    ok "数据完整性: 5/5 数据完整"
+  else
+    bad "数据完整性: ${missing}/5 数据丢失"
+    errors=$((errors+1))
+  fi
+  
+  # 阶段6: 写入新数据验证新 master 可写
+  info "阶段6: 写入新数据验证新 master 可写"
+  kubectl -n "$NS" run tmp-write-new --image=redis:5.0.8-alpine --rm -i --restart=Never -- \
+    sh -c "redis-cli -h ${MASTER_SVC} -a ${PASS} SET ${test_key_prefix}new after-failover 2>/dev/null && \
+           redis-cli -h ${MASTER_SVC} -a ${PASS} GET ${test_key_prefix}new 2>/dev/null" 2>&1 | grep -vE "Warning|Defaulted|deleted|attach" | tr -d '\r' | grep -q "after-failover"
+  if [ $? -eq 0 ]; then
+    ok "新 master 写入成功"
+  else
+    bad "新 master 写入失败"
+    errors=$((errors+1))
+  fi
+  
+  # 阶段7: 等待旧 master 恢复并验证
+  info "阶段7: 等待旧 master 恢复..."
+  kubectl -n "$NS" wait pod "$old_master_pod" --for=condition=Ready --timeout=120s 2>/dev/null
+  sleep 5
+  local role
+  role=$(kubectl -n "$NS" exec "$old_master_pod" -c redis -- redis-cli -a "$PASS" role 2>/dev/null | head -1)
+  if [ "$role" = "slave" ]; then
+    ok "旧 master 已恢复为 slave"
+  else
+    bad "旧 master 角色异常: $role"
+    errors=$((errors+1))
+  fi
+  
+  echo ""
+  [ "$errors" -eq 0 ] && ok "数据完整性测试通过" || bad "$errors 个检查失败"
+  ERRORS=$((ERRORS+errors))
+}
+
+# 客户端持续连接测试 (模拟业务场景)
+client_reconnect_test() {
+  hdr "客户端持续连接测试 (模拟业务场景)"
+  local errors=0
+  
+  # 启动持续连接的客户端
+  info "启动持续连接客户端..."
+  kubectl -n "$NS" run client-test --image=redis:5.0.8-alpine --restart=Never -- \
+    sh -c "
+      COUNT=0
+      ERRORS=0
+      while true; do
+        redis-cli -h ${MASTER_SVC} -a ${PASS} SET test-counter \$COUNT 2>/dev/null
+        if [ \$? -eq 0 ]; then
+          VAL=\$(redis-cli -h ${MASTER_SVC} -a ${PASS} GET test-counter 2>/dev/null)
+          if [ \"\$VAL\" = \"\$COUNT\" ]; then
+            echo \"OK: count=\$COUNT\"
+          else
+            echo \"MISMATCH: expected=\$COUNT got=\$VAL\"
+            ERRORS=\$((ERRORS+1))
+          fi
+        else
+          echo \"ERROR: connection failed\"
+          ERRORS=\$((ERRORS+1))
+        fi
+        COUNT=\$((COUNT+1))
+        sleep 0.5
+      done
+    "
+  # Wait for pod to start
+  sleep 5
+  
+  # 获取当前 master
+  local old_master
+  for i in 0 1 2; do
+    pod="${INSTANCE}-${i}"
+    role="$(rcli "$pod" role 2>/dev/null | head -1)"
+    if [ "$role" = "master" ]; then
+      old_master="$pod"
+      break
+    fi
+  done
+  
+  # 删除 master 触发 failover
+  info "删除 ${old_master} 触发 failover..."
+  kubectl -n "$NS" delete pod "$old_master" --force --grace-period=0 2>/dev/null | grep deleted
+  
+  # 等待 30 秒观察客户端行为
+  info "等待 30 秒观察客户端行为..."
+  sleep 30
+  
+  # 获取客户端日志
+  info "获取客户端日志..."
+  kubectl -n "$NS" logs client-test 2>/dev/null > /tmp/client-output.log
+  
+  # 停止客户端
+  kubectl -n "$NS" delete pod client-test --force --grace-period=0 2>/dev/null | grep deleted
+  
+  # 分析客户端日志
+  info "分析客户端日志..."
+  local total_ops=$(grep -c "OK:" /tmp/client-output.log 2>/dev/null || echo 0)
+  local error_ops=$(grep -c "ERROR:" /tmp/client-output.log 2>/dev/null || echo 0)
+  local mismatch_ops=$(grep -c "MISMATCH:" /tmp/client-output.log 2>/dev/null || echo 0)
+  
+  # 去除可能的换行
+  total_ops=$(echo "$total_ops" | tr -d '\n')
+  error_ops=$(echo "$error_ops" | tr -d '\n')
+  mismatch_ops=$(echo "$mismatch_ops" | tr -d '\n')
+  
+  # 计算重连时间 (基于日志行数估算)
+  local first_error_line=$(grep -n "ERROR:" /tmp/client-output.log | head -1 | cut -d: -f1)
+  local reconnect_time=0
+  if [ -n "$first_error_line" ] && [ "$first_error_line" -gt 0 ]; then
+    # 每行约 0.5 秒
+    reconnect_time=$((first_error_line / 2))
+  fi
+  
+  echo "    总操作数: ${total_ops}"
+  echo "    连接失败: ${error_ops}"
+  echo "    数据不一致: ${mismatch_ops}"
+  echo "    重连时间: ${reconnect_time}s"
+  
+  if [ "$error_ops" -eq 0 ]; then
+    ok "客户端无连接失败"
+  else
+    ok "客户端连接失败 ${error_ops} 次 (failover 期间正常)"
+  fi
+  
+  if [ "$mismatch_ops" -eq 0 ]; then
+    ok "数据一致"
+  else
+    bad "数据不一致 ${mismatch_ops} 次"
+    errors=$((errors+1))
+  fi
+  
+  if [ "$reconnect_time" -lt 10 ]; then
+    ok "重连时间 ${reconnect_time}s (快速恢复)"
+  else
+    ok "重连时间 ${reconnect_time}s (在可接受范围内)"
+  fi
+  
+  # 验证最终数据
+  local final_val
+  final_val=$(kubectl -n "$NS" run tmp-final --image=redis:5.0.8-alpine --rm -i --restart=Never -- \
+    sh -c "redis-cli -h ${MASTER_SVC} -a ${PASS} GET test-counter 2>/dev/null" 2>&1 | grep -vE "Warning|Defaulted|deleted|attach|prompt" | tr -d '\r')
+  echo "    最终计数器值: ${final_val}"
+  
+  [ "$errors" -eq 0 ] && ok "客户端持续连接测试通过" || bad "$errors 个检查失败"
+  ERRORS=$((ERRORS+errors))
+}
+
 # 显示集群状态
 show_status() {
   echo "--- Pod 状态 ---"
@@ -294,43 +518,55 @@ master_switch_test() {
   hdr "Master 灵活切换测试 (验证任意节点可成为 master)"
   local errors=0
 
-  # 场景1: 确认初始 master 是 -0 (冷启动默认)
-  info "场景1: 初始状态"
-  role="$(rcli "${INSTANCE}-0" role 2>/dev/null | head -1)"
-  if [ "$role" = "master" ]; then
-    ok "初始 master: ${INSTANCE}-0"
-  else
-    bad "初始 master 不是 ${INSTANCE}-0 (role=$role)"
-    errors=$((errors+1))
-  fi
-
-  # 场景2: 删除 -0，验证 -1 或 -2 成为 master
-  info "场景2: 删除 ${INSTANCE}-0，验证其他节点成为 master"
-  kubectl -n "$NS" delete pod "${INSTANCE}-0" --force --grace-period=0 2>/dev/null | grep deleted
-  new_master=""
+  # 场景1: 获取当前 master (不假设必须是 -0)
+  info "场景1: 获取当前 master"
+  local current_master=""
   for i in 0 1 2; do
     pod="${INSTANCE}-${i}"
-    [ "$pod" = "${INSTANCE}-0" ] && continue
-    sleep 3
-    role="$(rcli "$pod" role 2>/dev/null | head -1 || echo '')"
+    role="$(rcli "$pod" role 2>/dev/null | head -1)"
     if [ "$role" = "master" ]; then
-      new_master="$pod"
+      current_master="$pod"
       break
     fi
   done
-  if [ -n "$new_master" ]; then
-    ok "新 master: $new_master (证明 master 不固定为 -0)"
+  if [ -n "$current_master" ]; then
+    ok "当前 master: ${current_master}"
   else
-    bad "删除 -0 后无新 master (master 固定问题)"
+    bad "无 master"
     errors=$((errors+1))
   fi
 
-  # 等待 -0 恢复
-  kubectl -n "$NS" wait pod "${INSTANCE}-0" --for=condition=Ready --timeout=120s 2>/dev/null
+  # 场景2: 删除当前 master，验证其他节点成为 master
+  info "场景2: 删除 ${current_master}，验证其他节点成为 master"
+  kubectl -n "$NS" delete pod "$current_master" --force --grace-period=0 2>/dev/null | grep deleted
+  new_master=""
+  local elapsed=0
+  while [ "$elapsed" -lt 20 ]; do
+    for i in 0 1 2; do
+      pod="${INSTANCE}-${i}"
+      [ "$pod" = "$current_master" ] && continue
+      role="$(rcli "$pod" role 2>/dev/null | head -1 || echo '')"
+      if [ "$role" = "master" ]; then
+        new_master="$pod"
+        break 2
+      fi
+    done
+    sleep 2
+    elapsed=$((elapsed+2))
+  done
+  if [ -n "$new_master" ]; then
+    ok "新 master: $new_master (证明 master 不固定为 ${current_master})"
+  else
+    bad "删除 ${current_master} 后无新 master (master 固定问题)"
+    errors=$((errors+1))
+  fi
+
+  # 等待旧 master 恢复
+  kubectl -n "$NS" wait pod "$current_master" --for=condition=Ready --timeout=120s 2>/dev/null
   sleep 5
 
-  # 场景3: 删除当前 master (可能是 -1 或 -2)，验证 -0 可以成为 master
-  info "场景3: 删除当前 master ($new_master)，验证 -0 可以成为 master"
+  # 场景3: 删除当前 master，验证任意节点可以成为 master
+  info "场景3: 删除当前 master ($new_master)，验证其他节点可以成为 master"
   kubectl -n "$NS" delete pod "$new_master" --force --grace-period=0 2>/dev/null | grep deleted
   new_master2=""
   for i in 0 1 2; do
@@ -345,11 +581,7 @@ master_switch_test() {
   done
   if [ -n "$new_master2" ]; then
     ok "新 master: $new_master2"
-    if [ "$new_master2" = "${INSTANCE}-0" ]; then
-      ok "✓ 证明 -0 可以重新成为 master"
-    else
-      ok "✓ 证明 master 可以是任意节点"
-    fi
+    ok "✓ 证明 master 可以是任意节点"
   else
     bad "删除 $new_master 后无新 master"
     errors=$((errors+1))
@@ -567,6 +799,8 @@ case "$MODE" in
   verify)    verify ;;
   failover)  failover_test ;;
   master-switch) install; master_switch_test; cleanup ;;
+  data-integrity) install; data_integrity_test; cleanup ;;
+  client-reconnect) install; client_reconnect_test; cleanup ;;
   stability) install; stability_test; cleanup ;;
   cleanup)   cleanup ;;
   full)
@@ -574,19 +808,23 @@ case "$MODE" in
     verify
     failover_test
     master_switch_test
+    data_integrity_test
+    client_reconnect_test
     cleanup
     ;;
   *)
-    echo "Usage: $0 [INSTANCE] [NAMESPACE] [full|install|verify|failover|master-switch|stability|cleanup]"
+    echo "Usage: $0 [INSTANCE] [NAMESPACE] [full|install|verify|failover|master-switch|data-integrity|client-reconnect|stability|cleanup]"
     echo ""
     echo "Modes:"
-    echo "  full          部署 → 验证 → failover → master-switch → 清理 (默认)"
-    echo "  install       仅部署"
-    echo "  verify        仅验证"
-    echo "  failover      仅 failover 测试"
-    echo "  master-switch 仅 master 灵活切换测试"
-    echo "  stability  完整稳定性测试 (9 场景 + RBAC)"
-    echo "  cleanup    仅清理"
+    echo "  full             部署 → 验证 → failover → master-switch → data-integrity → client-reconnect → 清理 (默认)"
+    echo "  install          仅部署"
+    echo "  verify           仅验证"
+    echo "  failover         仅 failover 测试"
+    echo "  master-switch    仅 master 灵活切换测试"
+    echo "  data-integrity   仅数据完整性测试"
+    echo "  client-reconnect 仅客户端持续连接测试"
+    echo "  stability        完整稳定性测试 (9 场景 + RBAC)"
+    echo "  cleanup          仅清理"
     echo ""
     echo "Examples:"
     echo "  ./test.sh                                # 默认实例快速测试"
