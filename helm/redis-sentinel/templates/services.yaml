@@ -29,6 +29,7 @@ spec:
   ports:
     - name: redis
       port: 6379
+      protocol: TCP
 
 # <instance>-master: routes ONLY to master
 # (sidecar role-tagger sets redis-role=master on master pod → Service routes to it)
@@ -51,6 +52,7 @@ spec:
     - name: redis
       port: 6379
       targetPort: 6379
+      protocol: TCP
       {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort.master }}
       nodePort: {{ .Values.service.nodePort.master }}
       {{- end }}
@@ -75,6 +77,7 @@ spec:
     - name: redis
       port: 6379
       targetPort: 6379
+      protocol: TCP
       {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort.read }}
       nodePort: {{ .Values.service.nodePort.read }}
       {{- end }}
@@ -91,11 +94,13 @@ metadata:
     app: {{ include "redis-sentinel.sentinelName" . }}
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     {{- include "redis-sentinel.sentinelSelectorLabels" . | nindent 4 }}
   ports:
     - name: sentinel
       port: 26379
+      protocol: TCP
 
 {{- if .Values.redis.exporter.enabled }}
 # <instance>-exporter: Prometheus metrics for Redis
@@ -114,6 +119,7 @@ spec:
   ports:
     - name: metrics
       port: 9121
+      protocol: TCP
 {{- end }}
 
 {{- if .Values.sentinel.exporter.enabled }}
@@ -133,4 +139,5 @@ spec:
   ports:
     - name: metrics
       port: 9121
+      protocol: TCP
 {{- end }}
