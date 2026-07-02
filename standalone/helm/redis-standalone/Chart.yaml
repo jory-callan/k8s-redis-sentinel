@@ -1,0 +1,15 @@
+apiVersion: v2
+name: redis-standalone
+description: Redis 单机模式 (生产就绪, Deployment + PVC 持久化, 无故障转移)
+type: application
+version: 1.0.0
+appVersion: "6.2.20"
+keywords:
+  - redis
+  - standalone
+  - single
+  - cache
+home: https://github.com/redis/redis
+maintainers:
+  - name: redis-standalone
+icon: ""

@@ -1,0 +1,178 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "redis-standalone.instanceName" . }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-standalone.labels" . | nindent 4 }}
+    app: {{ include "redis-standalone.redisName" . }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: {{ .Values.backup.concurrencyPolicy | default "Forbid" }}
+  successfulJobsHistoryLimit: {{ .Values.backup.historyLimit | default 3 }}
+  failedJobsHistoryLimit: {{ .Values.backup.historyLimit | default 3 }}
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "redis-standalone.backupLabels" . | nindent 12 }}
+        spec:
+          restartPolicy: OnFailure
+          # 备份只通过 Service 网络访问 redis + 对象存储, 不调用 K8s API
+          initContainers:
+            # 阶段1: 从 redis 拉取 RDB 快照
+            # --rdb 通过复制协议拉取, 触发 redis fork 一次 (备份固有代价)
+            # 不挂 PVC, 避免与 redis pod 的 RWO PVC 冲突
+            - name: rdb-dumper
+              image: "{{ .Values.backup.dumperImage.repository }}:{{ .Values.backup.dumperImage.tag }}"
+              imagePullPolicy: {{ .Values.backup.dumperImage.pullPolicy }}
+              env:
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "redis-standalone.secretName" . }}
+                      key: redis-password
+                      optional: true
+                - name: INSTANCE_NAME
+                  value: {{ include "redis-standalone.instanceName" . }}
+                - name: NAMESPACE
+                  value: {{ .Release.Namespace }}
+              volumeMounts:
+                - name: rdb
+                  mountPath: /rdb
+              command:
+                - sh
+                - -c
+                - |
+                  set -u
+                  # 单机模式: 直接连 Service (无 master/slave 区分, 无 role-tagger)
+                  REDIS_HOST="${INSTANCE_NAME}.${NAMESPACE}.svc.cluster.local"
+                  echo "[dump] connecting ${REDIS_HOST}:6379"
+                  AUTH_ARGS=""
+                  [ -n "${REDIS_PASSWORD:-}" ] && AUTH_ARGS="-a ${REDIS_PASSWORD}"
+                  # AUTH 探活, 确认 redis 可达
+                  if ! redis-cli -h "${REDIS_HOST}" ${AUTH_ARGS} PING 2>/dev/null | grep -q PONG; then
+                    echo "[error] redis ${REDIS_HOST} unreachable"
+                    exit 1
+                  fi
+                  # --rdb 拉取 RDB (会阻塞直到传输完成)
+                  # timeout 防止大数据集时 hang (最长 10 分钟)
+                  echo "[dump] pulling RDB..."
+                  if ! timeout 600 redis-cli -h "${REDIS_HOST}" ${AUTH_ARGS} --rdb /rdb/dump.rdb 2>/dev/null; then
+                    echo "[error] --rdb failed or timed out"
+                    exit 1
+                  fi
+                  SIZE=$(wc -c < /rdb/dump.rdb 2>/dev/null || echo 0)
+                  echo "[dump] rdb size=${SIZE} bytes"
+                  if [ "${SIZE}" -lt 10 ]; then
+                    echo "[error] rdb too small, aborting"
+                    exit 1
+                  fi
+                  # 压缩节省带宽与存储
+                  gzip -f /rdb/dump.rdb
+                  GZ_SIZE=$(wc -c < /rdb/dump.rdb.gz)
+                  echo "[dump] gzipped=${GZ_SIZE} bytes"
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+          containers:
+            # 阶段2: 上传对象存储 + 清理旧备份
+            # 使用 rclone (覆盖 S3/MinIO/阿里云OSS/腾讯云COS/Azure/GCS 等 40+ 后端,
+            # 不绑定特定厂商, 通过环境变量配置, 切换存储只改 endpoint+provider)
+            - name: uploader
+              image: "{{ .Values.backup.image.repository }}:{{ .Values.backup.image.tag }}"
+              imagePullPolicy: {{ .Values.backup.image.pullPolicy }}
+              # rclone 配置全部走环境变量 (无需 rclone.conf 文件)
+              # 命名规范: RCLONE_CONFIG_<REMOTE>_<KEY>
+              # 此处 remote 名为 dst, 即访问 dst:bucket/path
+              env:
+                - name: RCLONE_CONFIG_DST_TYPE
+                  value: s3
+                - name: RCLONE_CONFIG_DST_PROVIDER
+                  value: {{ .Values.backup.provider | quote }}
+                - name: RCLONE_CONFIG_DST_ENDPOINT
+                  value: {{ .Values.backup.endpoint | quote }}
+                - name: RCLONE_CONFIG_DST_REGION
+                  value: {{ .Values.backup.region | quote }}
+                - name: RCLONE_CONFIG_DST_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "redis-standalone.backupSecretName" . }}
+                      key: access-key
+                - name: RCLONE_CONFIG_DST_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "redis-standalone.backupSecretName" . }}
+                      key: secret-key
+                {{- if .Values.backup.insecure }}
+                # 跳过 TLS 证书校验 (自签名 https 端点)
+                - name: RCLONE_CONFIG_DST_NO_CHECK_CERTIFICATE
+                  value: "true"
+                {{- end }}
+                # rclone 运行参数: 静默无交互, 失败快退出
+                - name: RCLONE_STATS
+                  value: "0"
+                - name: INSTANCE_NAME
+                  value: {{ include "redis-standalone.instanceName" . }}
+                - name: BUCKET
+                  value: {{ .Values.backup.bucket | quote }}
+                - name: PREFIX
+                  value: {{ (.Values.backup.prefix | default (include "redis-standalone.instanceName" .)) | quote }}
+                - name: RETENTION_DAYS
+                  value: {{ .Values.backup.retentionDays | quote }}
+              volumeMounts:
+                - name: rdb
+                  mountPath: /rdb
+                  readOnly: true
+              command:
+                - sh
+                - -c
+                - |
+                  set -u
+                  # rclone 默认会找 /config/rclone/rclone.conf 并报 NOTICE (即使全用 env)
+                  # 创建空文件让 NOTICE 闭嘴 (env 配置仍优先生效)
+                  mkdir -p /config/rclone && : > /config/rclone/rclone.conf
+                  # bucket 检查 (不创建, 应由外部预建)
+                  if ! rclone lsd dst: >/dev/null 2>&1; then
+                    echo "[error] cannot connect to object storage, check endpoint/credentials"
+                    exit 1
+                  fi
+                  if ! rclone lsf "dst:${BUCKET}" >/dev/null 2>&1; then
+                    echo "[error] bucket ${BUCKET} not found, please create it first"
+                    exit 1
+                  fi
+
+                  TS=$(date -u +%Y%m%d-%H%M%S)
+                  OBJECT_NAME="${INSTANCE_NAME}-dump-${TS}.rdb.gz"
+                  REMOTE_PATH="dst:${BUCKET}/${PREFIX}/${OBJECT_NAME}"
+                  echo "[upload] -> ${REMOTE_PATH}"
+                  # copyto: 单文件到单目标 (避免 copy 的目录遍历语义)
+                  if ! rclone copyto /rdb/dump.rdb.gz "${REMOTE_PATH}" 2>&1; then
+                    echo "[error] upload failed"
+                    exit 1
+                  fi
+                  # 验证: 列出对象, 文件应存在
+                  if ! rclone lsf "${REMOTE_PATH}" >/dev/null 2>&1; then
+                    echo "[error] upload verify failed, object not found"
+                    exit 1
+                  fi
+                  # rclone size --json 输出 {"count":N,"bytes":N}, 用 grep+cut 提取 bytes
+                  SIZE=$(rclone size "${REMOTE_PATH}" --json 2>/dev/null | grep -oE '"bytes":[0-9]+' | cut -d: -f2 || echo 0)
+                  echo "[upload] ok, object=${OBJECT_NAME}, size=${SIZE} bytes"
+
+                  # 保留策略: 删除 prefix 下超过 N 天的文件 (--min-age 指定最低年龄)
+                  # rclone delete 仅删除文件, 不删目录
+                  echo "[retention] removing backups older than ${RETENTION_DAYS}d under ${BUCKET}/${PREFIX}/"
+                  rclone delete "dst:${BUCKET}/${PREFIX}/" --min-age "${RETENTION_DAYS}d" 2>&1 || true
+
+                  # 列出当前备份清单
+                  echo "[retention] current backups:"
+                  rclone lsf "dst:${BUCKET}/${PREFIX}/" 2>&1 | tail -10
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+          volumes:
+            - name: rdb
+              emptyDir: {}
+{{- end }}

@@ -1,0 +1,27 @@
+{{- if .Values.pdb.enabled }}
+# ──────────────────────────────────────────────────────────────
+# PodDisruptionBudget — voluntary eviction 控制
+#
+# ⚠️ 单副本场景: minAvailable:1 会阻塞所有 voluntary eviction
+#    (节点 drain / kubectl drain / cluster-autoscaler 缩容)
+#    仅在需要严格阻止驱逐时启用, 默认禁用
+# ──────────────────────────────────────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "redis-standalone.redisName" . }}-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-standalone.labels" . | nindent 4 }}
+    app: {{ include "redis-standalone.redisName" . }}
+spec:
+  {{- with .Values.pdb.minAvailable }}
+  minAvailable: {{ . }}
+  {{- else }}
+  # 单副本默认 minAvailable:1 (等价 maxUnavailable:0, 阻止所有 eviction)
+  minAvailable: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "redis-standalone.redisSelectorLabels" . | nindent 6 }}
+{{- end }}

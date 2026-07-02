@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "redis-standalone.redisName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-standalone.labels" . | nindent 4 }}
+    app: {{ include "redis-standalone.redisName" . }}
+spec:
+  replicas: {{ .Values.redis.replicas }}
+  # 单机模式无需策略配置; RollingUpdate 默认即可 (单副本时新建后删旧)
+  selector:
+    matchLabels:
+      {{- include "redis-standalone.redisSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "redis-standalone.redisLabels" . | nindent 8 }}
+      annotations:
+        # Roll pods when configmap changes
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      # 单机模式无需 serviceAccount (无 role-tagger sidecar, 不调 K8s API)
+      terminationGracePeriodSeconds: 30
+      containers:
+        # ── Redis ──────────────────────────────────────
+        - name: redis
+          image: {{ include "redis-standalone.redisImage" . }}
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          command:
+            - sh
+            - /conf/startup.sh
+          ports:
+            - name: redis
+              containerPort: 6379
+          env:
+            {{- if .Values.common.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis-standalone.secretName" . }}
+                  key: redis-password
+                  optional: true
+            {{- end }}
+          # startupProbe: 覆盖 RDB 加载 + 冷启动 (大 RDB 加载可能较慢)
+          startupProbe:
+            exec:
+              command:
+                {{- include "redis-standalone.pingProbe" . | nindent 16 }}
+            initialDelaySeconds: {{ .Values.redis.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.redis.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.redis.probes.startup.failureThreshold }}
+          # readinessProbe: PING (Ready 即可接流量, 单机无角色概念)
+          readinessProbe:
+            exec:
+              command:
+                {{- include "redis-standalone.pingProbe" . | nindent 16 }}
+            initialDelaySeconds: {{ .Values.redis.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.redis.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.redis.probes.readiness.failureThreshold }}
+          livenessProbe:
+            exec:
+              command:
+                {{- include "redis-standalone.pingProbe" . | nindent 16 }}
+            initialDelaySeconds: {{ .Values.redis.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.redis.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.redis.probes.liveness.failureThreshold }}
+          volumeMounts:
+            - name: conf
+              mountPath: /conf
+              readOnly: true
+            - name: data
+              mountPath: /data
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+
+        {{- if .Values.redis.exporter.enabled }}
+        # ── Redis Exporter (Prometheus sidecar) ──────────
+        - name: exporter
+          image: {{ include "redis-standalone.redisExporterImage" . }}
+          imagePullPolicy: {{ .Values.redis.exporter.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: 9121
+          env:
+            - name: REDIS_ADDR
+              value: redis://127.0.0.1:6379
+            {{- if .Values.common.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis-standalone.secretName" . }}
+                  key: redis-password
+                  optional: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.redis.exporter.resources | nindent 12 }}
+        {{- end }}
+
+      volumes:
+        - name: conf
+          configMap:
+            name: {{ include "redis-standalone.configMapName" . }}
+            defaultMode: 0755
+        {{- if .Values.redis.persistence.enabled }}
+        # ── PVC: persistent storage (引用独立 PVC 资源) ──
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "redis-standalone.pvcName" . }}
+        {{- else }}
+        # ── emptyDir: non-persistent (data lost on pod restart) ──
+        - name: data
+          emptyDir: {}
+        {{- end }}

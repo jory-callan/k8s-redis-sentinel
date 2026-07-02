@@ -1,0 +1,70 @@
+{{- if .Values.networkPolicy.enabled }}
+# ──────────────────────────────────────────────────────────────
+# NetworkPolicy — 限制 Redis pod 的入站流量
+#
+# 默认策略: deny all ingress, 仅放行:
+#   - 6379: 业务 pod (networkPolicy.redisIngressFrom 配置)
+#   - 9121: Prometheus namespace 抓取 + 同 namespace (本地测试)
+#
+# 不影响出站 (egress 默认全放行)
+# ──────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "redis-standalone.redisName" . }}-np
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-standalone.labels" . | nindent 4 }}
+    app: {{ include "redis-standalone.redisName" . }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "redis-standalone.redisSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # 6379: 业务 pod (来自 redisIngressFrom, 跨 namespace)
+    {{- if .Values.networkPolicy.redisIngressFrom }}
+    - from:
+        {{- range .Values.networkPolicy.redisIngressFrom }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .namespace | quote }}
+          {{- if .podSelector }}
+          podSelector:
+            matchLabels:
+              {{- range $k, $v := .podSelector }}
+              {{ $k }}: {{ $v | quote }}
+              {{- end }}
+          {{- end }}
+        {{- end }}
+      ports:
+        - port: 6379
+          protocol: TCP
+    {{- end }}
+    # 6379: 同 namespace 同实例 pod (如 backup pod 访问)
+    {{- if .Values.backup.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "redis-standalone.backupSelectorLabels" . | nindent 14 }}
+      ports:
+        - port: 6379
+          protocol: TCP
+    {{- end }}
+    # 9121: Prometheus 抓取 (exporter)
+    {{- if .Values.redis.exporter.enabled }}
+    - from:
+        # 同 namespace (本地测试 / 单 namespace 部署)
+        - podSelector: {}
+        {{- if .Values.networkPolicy.prometheusNamespace }}
+        # Prometheus 所在 namespace
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.prometheusNamespace | quote }}
+        {{- end }}
+      ports:
+        - port: 9121
+          protocol: TCP
+    {{- end }}
+{{- end }}

@@ -1,0 +1,119 @@
+{{- if .Values.monitoring.enabled }}
+# ──────────────────────────────────────────────────────────────
+# Prometheus Operator 监控资源 (ServiceMonitor + PrometheusRule)
+# 需要 CRD: monitoring.coreos.com/v1 (Prometheus Operator)
+# ──────────────────────────────────────────────────────────────
+
+# ServiceMonitor: 让 Prometheus 自动发现并抓取 exporter
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "redis-standalone.instanceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-standalone.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - {{ include "redis-standalone.redisName" . }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.monitoring.interval | quote }}
+      path: /metrics
+      # 带密码抓取 (exporter 通过 REDIS_PASSWORD env 连接)
+      {{- if .Values.common.auth.enabled }}
+      params:
+        password:
+          - {{ include "redis-standalone.secretName" . | quote }}
+      {{- end }}
+
+{{- if .Values.monitoring.alerts.enabled }}
+# PrometheusRule: 关键告警规则 (单机模式精简, 无复制/sentinel/master 相关)
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "redis-standalone.instanceName" . }}-alerts
+  {{- $ruleNs := .Values.monitoring.alerts.namespace | default .Release.Namespace }}
+  namespace: {{ $ruleNs }}
+  labels:
+    {{- include "redis-standalone.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: redis-standalone-{{ include "redis-standalone.instanceName" . }}
+      rules:
+        # ── Redis 实例存活 ──────────────────────────────
+        - alert: RedisDown
+          expr: redis_up == 0
+          for: 1m
+          labels:
+            severity: critical
+            instance: {{ include "redis-standalone.instanceName" . }}
+          annotations:
+            summary: "Redis 实例宕机"
+            description: "Redis exporter 无法连接 Redis (redis_up=0), 持续 1m. 单机模式无 failover, 写入完全不可用"
+
+        # ── 内存使用高 ──────────────────────────────────
+        # 仅当 maxmemory>0 时有意义 (maxmemory=0 时不触发)
+        - alert: RedisMemoryHigh
+          expr: (redis_memory_max_bytes > 0) and (redis_used_memory_bytes / redis_memory_max_bytes > 0.9)
+          for: 5m
+          labels:
+            severity: warning
+            instance: {{ include "redis-standalone.instanceName" . }}
+          annotations:
+            summary: "Redis 内存使用率 > 90%"
+            description: "内存接近 maxmemory, 可能即将触发淘汰或拒绝写入"
+
+        # ── 拒绝连接数上升 ──────────────────────────────
+        - alert: RedisRejectedConnections
+          expr: rate(redis_rejected_connections_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            instance: {{ include "redis-standalone.instanceName" . }}
+          annotations:
+            summary: "Redis 有连接被拒绝"
+            description: "rejected_connections 持续上升, 可能达到 maxclients 或客户端用错密码"
+
+        # ── key 被淘汰 (内存压力) ───────────────────────
+        - alert: RedisEvictingKeys
+          expr: rate(redis_evicted_keys_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            instance: {{ include "redis-standalone.instanceName" . }}
+          annotations:
+            summary: "Redis 正在淘汰 key"
+            description: "evicted_keys 上升, 内存不足已触发淘汰策略"
+
+        # ── RDB 持久化失败 ──────────────────────────────
+        - alert: RedisBgSaveFailed
+          expr: redis_rdb_last_bgsave_status != 0
+          for: 1m
+          labels:
+            severity: warning
+            instance: {{ include "redis-standalone.instanceName" . }}
+          annotations:
+            summary: "Redis RDB bgsave 失败"
+            description: "rdb_last_bgsave_status 非 0, 持久化可能异常 (磁盘满/权限). 单机模式数据安全依赖 RDB, 需立即排查"
+
+        # ── 内存碎片率高 ─────────────────────────────────
+        - alert: RedisFragmentationHigh
+          expr: redis_memory_fragmentation_ratio > 1.5
+          for: 10m
+          labels:
+            severity: warning
+            instance: {{ include "redis-standalone.instanceName" . }}
+          annotations:
+            summary: "Redis 内存碎片率高"
+            description: "mem_fragmentation_ratio > 1.5, 物理内存利用率低, 考虑重启或 activedefrag"
+{{- end }}
+{{- end }}

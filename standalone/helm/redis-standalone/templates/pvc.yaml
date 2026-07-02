@@ -1,0 +1,27 @@
+{{- if .Values.redis.persistence.enabled }}
+# ──────────────────────────────────────────────────────────────
+# PersistentVolumeClaim — Redis 数据持久化
+#
+# 单机模式: 单 PVC (RWO), Deployment 引用
+# 注: Deployment 不支持 volumeClaimTemplates (StatefulSet 专属), 需独立 PVC 资源
+# 风险: Pod 重新调度到其他节点时, 若 StorageClass 不支持跨节点挂载 (如 local-path),
+#       PVC 可能无法挂载导致 Pod Pending. 建议用网络存储 (csi/网络块存储)
+# ──────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "redis-standalone.pvcName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-standalone.labels" . | nindent 4 }}
+    app: {{ include "redis-standalone.redisName" . }}
+spec:
+  accessModes:
+    {{- toYaml .Values.redis.persistence.accessModes | nindent 4 }}
+  {{- if .Values.redis.persistence.storageClass }}
+  storageClassName: {{ .Values.redis.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.redis.persistence.size | quote }}
+{{- end }}

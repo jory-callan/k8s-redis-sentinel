@@ -1,0 +1,61 @@
+═══════════════════════════════════════════════════════════════
+  Redis-Standalone deployed: {{ include "redis-standalone.instanceName" . }}
+  Namespace: {{ .Release.Namespace }}
+═══════════════════════════════════════════════════════════════
+
+⚠️  单机模式 — 无故障转移, master 宕机即停服
+    生产关键业务请评估是否能接受短暂中断, 否则请用 redis-sentinel chart
+
+1. Wait for pod to be ready:
+
+  kubectl -n {{ .Release.Namespace }} wait pod --for=condition=Ready \
+    -l "redis-standalone.k8s.io/instance={{ include "redis-standalone.instanceName" . }}" --timeout=300s
+
+2. Connection info:
+
+  {{- $inst := include "redis-standalone.instanceName" . }}
+  {{- $ns := .Release.Namespace }}
+  Redis:  {{ $inst }}.{{ $ns }}.svc:6379
+
+  {{- if .Values.redis.exporter.enabled }}
+  Metrics: {{ $inst }}-exporter.{{ $ns }}.svc:9121
+  {{- end }}
+
+3. Get password:
+
+  {{- if .Values.common.auth.enabled }}
+  {{- if .Values.common.auth.existingSecret }}
+  kubectl -n {{ $ns }} get secret {{ .Values.common.auth.existingSecret }} -o jsonpath='{.data.redis-password}' | base64 -d
+  {{- else }}
+  kubectl -n {{ $ns }} get secret {{ include "redis-standalone.secretName" . }} -o jsonpath='{.data.redis-password}' | base64 -d
+  {{- end }}
+
+  Connect with password:
+  kubectl -n {{ $ns }} exec deploy/{{ $inst }} -- redis-cli -a '<PASSWORD>' ping
+  {{- else }}
+  No password (auth disabled).
+  kubectl -n {{ $ns }} exec deploy/{{ $inst }} -- redis-cli ping
+  {{- end }}
+
+4. Verify state:
+
+  kubectl -n {{ $ns }} get pods -l "redis-standalone.k8s.io/instance={{ $inst }}" -o wide
+  kubectl -n {{ $ns }} exec deploy/{{ $inst }} -- redis-cli INFO server | head -5
+
+5. {{- if eq .Values.service.type "NodePort" }} NodePort access:{{ else }} Expose externally (optional):{{ end }}
+
+  {{- if eq .Values.service.type "NodePort" }}
+  NodePort is enabled:
+    Redis: <node-ip>:{{ .Values.service.nodePort | default "<auto>" }}
+  {{- else }}
+  Set service.type=NodePort or create your own Service with selector:
+    redis-standalone.k8s.io/instance={{ $inst }}, redis-standalone.k8s.io/component=redis
+  {{- end }}
+
+{{- if .Values.backup.enabled }}
+6. Backup (CronJob):
+  Schedule: {{ .Values.backup.schedule }}
+  Bucket:   {{ .Values.backup.bucket }}/{{ .Values.backup.prefix | default (include "redis-standalone.instanceName" .) }}/
+  Check latest backup:
+    kubectl -n {{ $ns }} get jobs -l "job-name" | tail -5
+{{- end }}

@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "redis-standalone.configMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-standalone.labels" . | nindent 4 }}
+    app: {{ include "redis-standalone.redisName" . }}
+data:
+  redis.conf: |
+    port 6379
+    protected-mode no
+    daemonize no
+    pidfile /data/redis.pid
+    logfile ""
+    dir /data
+    {{- range .Values.redis.config }}
+    {{ . }}
+    {{- end }}
+    maxmemory {{ .Values.redis.maxmemory }}
+    maxmemory-policy {{ .Values.redis.maxmemoryPolicy }}
+
+  startup.sh: |
+    #!/bin/sh
+    # Redis standalone startup — single master, no role decision
+    # No 'set -e' (dash + local + $() = silent exit, consistent with sentinel chart conventions)
+
+    echo "[startup] standalone redis starting"
+
+    # ── Build redis.conf (resolve password) ──────────
+    cp /conf/redis.conf /data/redis.conf
+
+    if [ -n "${REDIS_PASSWORD:-}" ]; then
+      echo "requirepass ${REDIS_PASSWORD}" >> /data/redis.conf
+      echo "[auth] password set"
+    else
+      echo "[auth] no password (insecure)"
+    fi
+
+    # ── Start redis-server ───────────────────────────
+    # Single mode: always master, no replication, no sentinel query
+    echo "[role] master (standalone)"
+    exec redis-server /data/redis.conf

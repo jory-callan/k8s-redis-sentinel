@@ -1,0 +1,46 @@
+# ──────────────────────────────────────────────────────────────
+# Redis Service — 单 ClusterIP, 路由到 redis pod
+#
+# 单机模式无 master/slave 区分, 无 read/write 分离
+# 所有客户端通过此 Service 访问 redis
+# ──────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis-standalone.redisName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-standalone.labels" . | nindent 4 }}
+    app: {{ include "redis-standalone.redisName" . }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "redis-standalone.redisSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort }}
+      nodePort: {{ .Values.service.nodePort }}
+      {{- end }}
+
+{{- if .Values.redis.exporter.enabled }}
+---
+# Redis Exporter Service — Prometheus metrics
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis-standalone.redisName" . }}-exporter
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "redis-standalone.labels" . | nindent 4 }}
+    app: {{ include "redis-standalone.redisName" . }}
+spec:
+  selector:
+    {{- include "redis-standalone.redisSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9121
+      protocol: TCP
+{{- end }}

@@ -1,0 +1,204 @@
+# ═══════════════════════════════════════════════════════════════
+# Redis-Standalone Helm Chart — Values
+#
+# Redis 单机模式: 1 副本 Deployment + PVC 持久化
+# ⚠️ 无故障转移 — master 宕机即停服, 靠 Pod 重启 + RDB 恢复
+# ⚠️ 单点风险 — 生产关键业务请用 redis-sentinel chart (自动 failover)
+#
+# 适用场景: 缓存 / 非关键业务 / 开发测试 / 可接受短暂中断的服务
+#
+# 结构: common (共享) + redis (Redis pod)
+#
+# Usage:
+#   helm install my-redis ./helm/redis-standalone -n redis --create-namespace
+#   helm install cache ./helm/redis-standalone -n middleware \
+#     --set common.instanceName=redis-app-cache \
+#     --set common.auth.password=mypassword
+# ═══════════════════════════════════════════════════════════════
+
+# ── 共享配置 ────────────────────────────────────────────────────
+common:
+  # 实例名称 (业务强关联, 用于资源前缀隔离, 支持同命名空间多实例)
+  # 默认使用 release name; K8s 资源名最长 63 字符, Pod 名 = instance + "-xxxxx" (Deployment 随机后缀)
+  # 故 instanceName 最长 42 字符 (留余量给 Pod 后缀)
+  instanceName: ""
+
+  # 认证
+  auth:
+    enabled: true
+    # 直接指定密码 (生产环境建议用 existingSecret)
+    password: "redis123"
+    # 使用已存在的 Secret (优先于 password), 需包含 key: redis-password
+    existingSecret: ""
+
+# ── Redis Pod 配置 ─────────────────────────────────────────────
+redis:
+  image:
+    repository: redis
+    # ⚠️ 确认 tag 在镜像仓库存在; Redis 6.2 系列官方最新为 6.2.14
+    tag: "6.2.20"
+    pullPolicy: IfNotPresent
+
+  # 副本数 — 单机模式固定 1, 增大无意义 (单 PVC RWO 无法多 Pod 挂载)
+  # 如需高可用请改用 redis-sentinel chart
+  replicas: 1
+
+  # 资源限制
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    # limits:
+    #   cpu: 500m
+    #   memory: 512Mi
+
+  # 内存上限与淘汰策略 (生产建议显式设置 maxmemory, 默认 0=不限制)
+  # maxmemory: "512mb"              # 例: 512mb / 1gb / 0
+  # maxmemoryPolicy: "allkeys-lru"  # noeviction(默认) | allkeys-lru | volatile-lru | allkeys-lfu ...
+  maxmemory: "0"
+  maxmemoryPolicy: "noeviction"
+
+  # 持久化存储 (单机模式强烈建议开启, 否则 Pod 重启数据全失)
+  persistence:
+    enabled: true
+    # 存储类 (留空使用集群默认 StorageClass)
+    storageClass: ""
+    size: 1Gi
+    accessModes:
+      - ReadWriteOnce
+
+  # Prometheus exporter sidecar
+  exporter:
+    enabled: true
+    image:
+      repository: oliver006/redis_exporter
+      tag: "v1.57.0"
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 25m
+        memory: 16Mi
+
+  # 额外 redis.conf 配置 (每项 = 一行, 直接追加到 redis.conf)
+  # 注: port/dir/daemonize/protected-mode/requirepass 由模板自动生成
+  # 单机模式无需 replica-/slave- 相关配置
+  config:
+    - "save 900 1"
+    - "save 300 10"
+    - "save 60 10000"
+    - "timeout 0"
+    - "tcp-keepalive 300"
+    - "tcp-backlog 511"
+
+  # 健康检查
+  # 单机模式无冷启动等待逻辑, 探针时间窗可缩短
+  # liveness initialDelay 覆盖 RDB 加载最慢场景 (大 RDB 加载需更久)
+  probes:
+    startup:
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      failureThreshold: 30
+    readiness:
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      failureThreshold: 3
+    liveness:
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      failureThreshold: 3
+
+# ── Service 配置 ──────────────────────────────────────────────
+service:
+  # 类型 (默认 ClusterIP)
+  # 可选: ClusterIP | NodePort | LoadBalancer
+  type: ClusterIP
+  # NodePort 配置 (type=NodePort 时生效, 需自行选择未占用端口)
+  nodePort: ""
+  # annotations: {}
+
+# ── PodDisruptionBudget ───────────────────────────────────────
+# ⚠️ 单副本场景: PDB minAvailable:1 会阻塞所有 voluntary eviction (含节点 drain)
+#    默认禁用; 如需阻止 eviction 请显式启用
+pdb:
+  enabled: false
+  # minAvailable: 1  # 单副本只能用 1 (maxUnavailable:0 等价)
+
+# ── NetworkPolicy ─────────────────────────────────────────────
+# 限制 Redis pod 入站流量 (egress 默认放行)
+# 启用后: 仅 redisIngressFrom 配置的业务 pod + Prometheus 可访问 6379
+networkPolicy:
+  enabled: false
+  # 允许访问 6379 的业务来源 (跨 namespace)
+  # 空数组 = 只允许同 namespace 内同实例 pod
+  # 每项: { namespace: <ns>, podSelector: {<label>: <value>} }
+  # podSelector 可省略 (留空 = 整个 namespace 的 pod)
+  redisIngressFrom: []
+  # 例:
+  # - namespace: app
+  #   podSelector:
+  #     app: web
+  # Prometheus 所在 namespace (用于抓取 9121 metrics)
+  # 留空 = 不允许跨 namespace 抓取 (仅同 namespace)
+  prometheusNamespace: "monitoring"
+
+# ── Prometheus 监控 (ServiceMonitor + PrometheusRule) ────────
+# 需要 Prometheus Operator (CRD: monitoring.coreos.com/v1)
+monitoring:
+  enabled: false
+  # ServiceMonitor 抓取间隔
+  interval: 15s
+  # PrometheusRule 告警规则 (启用时自动创建关键告警)
+  alerts:
+    enabled: true
+    # 告警发送到的 namespace (PrometheusRule 资源所在 ns)
+    namespace: ""
+
+# ── 备份 (CronJob → 对象存储) ─────────────────────────────────
+# 单机模式无副本兜底, 定时备份是数据安全的最后一道防线
+# 原理: redis-cli --rdb 通过复制协议拉 RDB (触发 redis fork, 不挂 PVC)
+# 上传工具: rclone (支持 S3/MinIO/阿里云OSS/腾讯云COS/Azure/GCS 等 40+ 后端,
+#           不绑定特定厂商, 配置改 endpoint+provider 即可切换)
+backup:
+  enabled: false
+  # 上传镜像 (rclone, 覆盖 40+ 对象存储后端)
+  image:
+    repository: rclone/rclone
+    tag: "1.66.0"
+    pullPolicy: IfNotPresent
+  # RDB 拉取镜像 (需含 redis-cli)
+  dumperImage:
+    repository: redis
+    tag: "6.2.20"
+    pullPolicy: IfNotPresent
+  # Cron 调度 (默认每天 02:00)
+  schedule: "0 2 * * *"
+  # 并发控制: 上一次未完成则跳过
+  concurrencyPolicy: Forbid
+  # 保留历史 Job 数
+  historyLimit: 3
+  # 对象存储配置 (rclone S3 backend)
+  # endpoint: 集群内 MinIO / 云厂商 S3 兼容端点
+  endpoint: "http://minio.minio.svc.cluster.local:80"
+  # provider: rclone S3 backend 类型, 决定厂商特定行为
+  #   Minio / AWS / Alibaba / Tencent / Ceph / Other (空=自动)
+  # 切换存储只改 endpoint+provider, 不改脚本
+  provider: "Minio"
+  # 外部 https 端点用自签名证书时设 true (跳过证书校验, 集群内 http 无需)
+  insecure: false
+  bucket: "redis-test"
+  # 备份在 bucket 下的子路径前缀 (默认用 instanceName 自动隔离多实例)
+  prefix: ""
+  region: "us-east-1"
+  # 凭证 (生产建议用 existingSecret)
+  accessKey: "minioadmin"
+  secretKey: "minioadmin"
+  # 使用已存在的 Secret (优先于 accessKey/secretKey)
+  # 需含 key: access-key, secret-key
+  existingSecret: ""
+  # 保留天数 (超过自动删除)
+  retentionDays: 7
+  # 资源
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
